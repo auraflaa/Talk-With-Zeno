@@ -1,0 +1,8 @@
+{
+  "name": "Talk with Zeno",
+  "description": "A calm, voice-first AI companion named Zeno.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ]
+}
