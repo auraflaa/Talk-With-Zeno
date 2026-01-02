@@ -7,7 +7,11 @@ export default defineConfig(({ mode }) => {
     return {
       server: {
         port: 3000,
-        host: '0.0.0.0',
+        host: '0.0.0.0', // Allow access from local network
+        strictPort: false, // Try next available port if 3000 is taken
+        hmr: {
+          overlay: false // Disable error overlay to prevent PostCSS errors from blocking
+        }
       },
       plugins: [react()],
       define: {
@@ -18,6 +22,9 @@ export default defineConfig(({ mode }) => {
         alias: {
           '@': path.resolve(__dirname, '.'),
         }
+      },
+      css: {
+        postcss: {} // Disable PostCSS processing (using Tailwind CDN)
       }
     };
 });

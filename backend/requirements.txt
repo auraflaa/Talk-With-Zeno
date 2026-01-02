@@ -1,0 +1,23 @@
+# Python dependencies for Talk With Zeno backend
+# Install with: pip install -r backend/requirements.txt
+
+# Web framework
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# HTTP requests (for Google OAuth)
+requests>=2.31.0
+
+# Google Cloud services
+google-cloud-speech>=2.21.0
+google-generativeai>=0.3.0
+
+# Groq SDK for TTS
+groq>=1.0.0
+
+# Note: SQLite is built into Python, no installation needed!
+# Note: Groq API key needed for TTS (set GROQ_API_KEY in .env.local)
+

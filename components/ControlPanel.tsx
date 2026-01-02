@@ -48,7 +48,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
                     ? 'bg-primary hover:bg-primary-hover text-white shadow-xl scale-110' 
                     : 'bg-neutral text-white hover:bg-neutral-focus'
                 }`}
-                title={isListening ? "Mute Microphone" : "Unmute Microphone"}
+                title={isListening ? "Click to stop recording" : "Click to start recording"}
             >
                 {isListening ? <Mic size={32} /> : <MicOff size={32} />}
             </button>

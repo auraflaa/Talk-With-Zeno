@@ -158,23 +158,15 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, onLogout, the
     };
 
     const handleUserSendMessage = (text: string) => {
+        // Add user message to UI immediately
         updateActiveSessionMessages({
             id: Date.now().toString(),
             role: 'user',
             content: text,
             timestamp: new Date()
         });
-
-        if (interactionMode === InteractionMode.TEXT) {
-            setTimeout(() => {
-                updateActiveSessionMessages({
-                    id: Date.now().toString() + '_ai',
-                    role: 'assistant',
-                    content: "This is a placeholder response. I am listening.",
-                    timestamp: new Date()
-                });
-            }, 1000);
-        }
+        // Note: The actual backend API call is handled by LiveInterface's handleTextSubmit
+        // This function just updates the UI state
     };
 
     const handleEndSession = () => {
@@ -243,6 +235,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, onLogout, the
                                             content: text,
                                             timestamp: new Date()
                                         })}
+                                        userId={currentUser.id}
+                                        conversationId={activeSession.id}
                                     />
                                 )}
                             </motion.div>
