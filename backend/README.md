@@ -64,18 +64,20 @@ Get user personalization data
 
 ### STT Service (`services/stt_service.py`)
 - Google Cloud Speech-to-Text
-- Converts audio (WebM/WAV) to text
+- Model: `phone_call` (optimized for voice conversations)
+- Converts audio (WebM/WAV) to text with chunk-wise processing
 - Requires: `GOOGLE_APPLICATION_CREDENTIALS`
 
 ### LLM Service (`services/llm_service.py`)
 - Google Gemini models with fallback
-- Models: gemini-2.5-flash (primary), gemini-1.5-flash, gemini-2.5-pro, gemini-1.5-pro, gemini-pro (with fallback)
-- Includes personalization context
+- Models: gemini-2.0-flash (primary, optimized), gemini-2.5-flash, gemini-2.0-flash-lite, gemini-2.5-pro (with fallback)
+- Includes personalization context and response caching
 - Can update personalization via commands: `[ADD_TOPIC:"..."], [ADD_GOAL:"..."], etc.`
 
 ### TTS Service (`services/tts_service.py`)
-- Groq TTS (primary): `canopylabs/orpheus-v1-english`
+- Groq TTS (primary): `canopylabs/orpheus-v1-english` with "troy" voice
 - Gemini TTS (fallback): `gemini-2.5-flash-tts`, `gemini-2.5-pro-tts`
+- Includes audio response caching
 - Requires: `GROQ_API_KEY` or `GEMINI_API_KEY`
 
 ### Storage Service (`services/storage_service.py`)
@@ -88,21 +90,27 @@ SQLite database for user identity (`data/zeno.db`)
 
 Initialize:
 ```bash
-python init_db.py
+python scripts/init_db.py
 ```
 
 ## Testing
 
 Test all services:
 ```bash
-# Quick service health check
-python test_services.py
-
 # Comprehensive service test (includes Database, Storage, API)
-python test_all_services.py
+python backend/tests/test_all_services.py
 
-# End-to-end pipeline test
-python test_pipeline.py
+# End-to-end pipeline test (text, voice, storage, audio files)
+python backend/tests/test_pipeline.py
+
+# Streaming pipeline test (chunk-wise processing)
+python backend/tests/test_streaming_pipeline.py
+
+# Deep production-grade analysis (includes STT chunk size analysis)
+python backend/tests/deep_analysis.py
+
+# Pipeline integration test
+python backend/tests/test_pipeline_integration.py
 ```
 
 ## Environment Variables

@@ -38,15 +38,13 @@ class LLMService:
             genai.configure(api_key=self.api_key)
             print(f"LLM: Configured with API key (length: {len(self.api_key)})")
             
-            # Prioritize flash models for better performance (2.4x faster)
-            # Flash models are optimized for speed while maintaining good quality
+            # Prioritize flash models for better performance
+            # Based on deep analysis: gemini-2.0-flash is 56% faster than 2.5-flash (3587ms vs 6884ms)
             model_names = [
-                'gemini-2.5-flash',     # Primary: Fastest and most capable flash model
-                'gemini-2.0-flash',     # Fallback: Alternative flash model
+                'gemini-2.0-flash',     # Primary: Optimal balance (3587ms avg, best performance)
+                'gemini-2.5-flash',     # Fallback: Alternative flash model
                 'gemini-2.0-flash-lite', # Fallback: Lightweight flash model
-                'gemini-1.5-flash',     # Fallback: Legacy flash model
                 'gemini-2.5-pro',       # Fallback: Pro model if flash unavailable
-                'gemini-1.5-pro',       # Fallback: Alternative pro model
                 'gemini-pro'            # Fallback: Legacy pro model
             ]
             
@@ -796,6 +794,17 @@ Remember: Always place update commands at the END of your response, after your n
             print(f"LLM.generate_response: User message length: {len(user_message)} characters")
             print(f"LLM.generate_response: Conversation history: {len(conversation_history) if conversation_history else 0} messages")
             
+            # Check cache for simple queries without conversation history
+            # Only cache if no conversation history (to avoid stale responses)
+            from backend.services.cache_service import get_cache_service
+            cache = get_cache_service()
+            
+            if not conversation_history or len(conversation_history) == 0:
+                cached_result = cache.get('llm', user_id=user_id, user_message=user_message.lower().strip())
+                if cached_result:
+                    print(f"LLM: Cache hit for message: '{user_message[:50]}...'")
+                    return cached_result
+            
             # Build system prompt with personalization (pass conversation history for style learning)
             system_prompt = self._build_system_prompt(user_id, conversation_history, user_name)
             
@@ -836,11 +845,20 @@ Remember: Always place update commands at the END of your response, after your n
             print(f"LLM: Cleaned response length: {len(clean_response)} characters")
             print(f"LLM: Cleaned response preview: {clean_response[:150]}...")
             
-            return {
+            result = {
                 "response": clean_response,
                 "updates_applied": updates,
                 "raw_response": response_text
             }
+            
+            # Cache result for simple queries (no conversation history)
+            if not conversation_history or len(conversation_history) == 0:
+                # Only cache if no updates were applied (to avoid caching personalized responses)
+                if not updates:
+                    cache.set('llm', result, ttl_seconds=7200, user_id=user_id, user_message=user_message.lower().strip())
+                    print(f"LLM: Cached response for message: '{user_message[:50]}...'")
+            
+            return result
         except Exception as e:
             print(f"ERROR in generate_response: {e}")
             import traceback

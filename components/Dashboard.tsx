@@ -5,6 +5,7 @@ import { LiveInterface } from './LiveInterface';
 import { InteractionMode, ChatSession, Message, User } from '../types';
 import { Menu } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { greetingService } from '../services/greetingService';
 
 interface DashboardProps {
     currentUser: User;
@@ -17,6 +18,54 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, onLogout, the
     
     // Dynamic Storage Key based on User ID
     const STORAGE_KEY = `zeno_chats_${currentUser.id}`;
+
+    // Initialize greeting service and pre-generate greeting on mount
+    useEffect(() => {
+        greetingService.init();
+        
+        // Pre-generate greeting in background when app starts
+        const preGenerateGreeting = async () => {
+            try {
+                // Check if we need to generate a new greeting
+                const cached = greetingService.getCachedGreeting();
+                if (!cached || !greetingService.isCachedForUser(currentUser.name)) {
+                    console.log('Dashboard: Pre-generating greeting for', currentUser.name);
+                    
+                    // Import apiService dynamically to avoid circular dependencies
+                    const { apiService } = await import('../services/apiService');
+                    
+                    // Generate greeting in background
+                    const greetingPrompt = "Start the conversation with a friendly greeting.";
+                    const response = await apiService.processText(
+                        greetingPrompt,
+                        currentUser.id,
+                        undefined, // No conversation ID yet
+                        true,  // Generate audio
+                        currentUser.name
+                    );
+                    
+                    // Cache the greeting
+                    if (response.text_response && response.audio_base64) {
+                        greetingService.cacheGreeting(
+                            response.text_response,
+                            response.audio_base64,
+                            currentUser.name
+                        );
+                        console.log('Dashboard: Pre-generated and cached greeting');
+                    }
+                } else {
+                    console.log('Dashboard: Using existing cached greeting');
+                }
+            } catch (error) {
+                console.error('Dashboard: Error pre-generating greeting:', error);
+                // Non-critical - greeting will generate on first use
+            }
+        };
+        
+        // Pre-generate after a short delay to not block initial render
+        const timeoutId = setTimeout(preGenerateGreeting, 1000);
+        return () => clearTimeout(timeoutId);
+    }, [currentUser.id, currentUser.name]);
 
     // --- STATE ---
     const [sessions, setSessions] = useState<ChatSession[]>([]);

@@ -99,9 +99,26 @@ def process_voice():
         if not user_id:
             return jsonify({"error": "user_id is required"}), 400
         
+        # Validate user_id (prevent injection)
+        if not isinstance(user_id, str) or len(user_id) > 100 or not user_id.strip():
+            return jsonify({"error": "Invalid user_id format"}), 400
+        user_id = user_id.strip()
+        
         user_name = request.form.get('user_name')  # Optional user name
-        conversation_id = request.form.get('conversation_id') or str(uuid.uuid4())
+        if user_name and (not isinstance(user_name, str) or len(user_name) > 100):
+            user_name = None  # Ignore invalid user_name
+        
+        conversation_id = request.form.get('conversation_id')
+        if conversation_id:
+            # Validate conversation_id
+            if not isinstance(conversation_id, str) or len(conversation_id) > 100:
+                conversation_id = None  # Ignore invalid conversation_id
+        if not conversation_id:
+            conversation_id = str(uuid.uuid4())
+        
         language_code = request.form.get('language_code', 'en-US')
+        if not isinstance(language_code, str) or len(language_code) > 10:
+            language_code = 'en-US'  # Default to en-US if invalid
         
         # Get audio file
         if 'audio' not in request.files:
@@ -118,8 +135,6 @@ def process_voice():
         if len(audio_data) > 10 * 1024 * 1024:  # 10MB limit
             return jsonify({"error": "Audio file too large (max 10MB). Please record a shorter message."}), 400
         
-        print(f"Audio validation: size={len(audio_data)} bytes, format={audio_format}, valid=True")
-        
         # Detect audio format from filename or content type
         filename = audio_file.filename or 'audio.webm'
         audio_format = 'webm'  # Default
@@ -128,6 +143,7 @@ def process_voice():
         elif filename.endswith('.webm') or filename.endswith('.opus'):
             audio_format = 'webm'
         
+        print(f"Audio validation: size={len(audio_data)} bytes, format={audio_format}, valid=True")
         print(f"Received audio file: {filename}, size: {len(audio_data)} bytes, format: {audio_format}")
         
         # Get services
@@ -354,6 +370,276 @@ def process_voice():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/voice/stream/chunk', methods=['POST'])
+def process_stream_chunk():
+    """
+    Streaming STT endpoint - processes audio chunks continuously
+    Returns text for each chunk, or triggers LLM when noise is detected
+    
+    Request:
+        - audio: Audio chunk (multipart/form-data)
+        - session_id: Streaming session ID (required)
+        - user_id: User identifier (required)
+        - conversation_id: Optional conversation ID
+        - language_code: Optional language code (default: en-US)
+        - is_final: Optional flag to force processing (default: false)
+    
+    Returns:
+        - chunk_text: Transcribed text for this chunk (if any)
+        - is_noise: True if chunk contains only noise
+        - merged_text: Merged text from all chunks (if noise detected)
+        - should_process: True if should send to LLM
+        - session_id: Session ID
+    """
+    try:
+        from backend.services.streaming_service import get_streaming_service
+        streaming_service = get_streaming_service()
+        
+        # Get request data
+        session_id = request.form.get('session_id') or ''
+        user_id = request.form.get('user_id')
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+        
+        user_name = request.form.get('user_name')
+        conversation_id = request.form.get('conversation_id')
+        language_code = request.form.get('language_code', 'en-US')
+        is_final = request.form.get('is_final', 'false').lower() == 'true'
+        
+        # Get or create session
+        session = streaming_service.get_session(session_id)
+        if not session:
+            # Create new session
+            if not conversation_id:
+                conversation_id = str(uuid.uuid4())
+            session_id = streaming_service.create_session(user_id, conversation_id, language_code)
+            session = streaming_service.get_session(session_id)
+            if not session:
+                return jsonify({"error": "Failed to create session"}), 500
+        
+        # Get audio chunk
+        if 'audio' not in request.files:
+            return jsonify({"error": "audio chunk is required"}), 400
+        
+        audio_file = request.files['audio']
+        audio_data = audio_file.read()
+        
+        # Handle empty or very small chunks (for noise detection)
+        if len(audio_data) < 100:  # Too small to be valid audio
+            print(f"Streaming: Received very small chunk ({len(audio_data)} bytes) - treating as noise/silence")
+            # Check if we have previous text chunks to process
+            merged_text = session.get_merged_text()
+            if merged_text and len(merged_text.strip()) >= 2:
+                # We have accumulated text, process it
+                return jsonify({
+                    "chunk_text": "",
+                    "is_noise": True,
+                    "merged_text": merged_text,
+                    "should_process": True,
+                    "session_id": session_id,
+                    "conversation_id": session.conversation_id
+                }), 200
+            else:
+                # No accumulated text yet, just mark as noise
+                return jsonify({
+                    "chunk_text": "",
+                    "is_noise": True,
+                    "should_process": False,
+                    "session_id": session_id,
+                    "conversation_id": session.conversation_id
+                }), 200
+        
+        # Add chunk to session
+        session.add_chunk(audio_data)
+        
+        # Detect audio format
+        filename = audio_file.filename or 'audio.webm'
+        audio_format = 'webm'
+        if filename.endswith('.wav'):
+            audio_format = 'wav'
+        
+        # Get services
+        svcs = services()
+        
+        if not svcs['stt'].client:
+            return jsonify({"error": "STT service not available"}), 500
+        
+        # Process this chunk with STT
+        chunk_text = svcs['stt'].transcribe_audio(
+            audio_data,
+            language_code=language_code,
+            audio_format=audio_format
+        )
+        
+        # Check if chunk is noise (empty or very short)
+        is_noise = False
+        should_process = False
+        merged_text = ""
+        
+        if not chunk_text or len(chunk_text.strip()) < 2:
+            # This chunk is noise
+            is_noise = True
+            print(f"Streaming: Chunk {len(session.audio_chunks)} is noise (no text detected)")
+            
+            # If we have previous text chunks, merge and trigger processing
+            merged_text = session.get_merged_text()
+            if merged_text and len(merged_text.strip()) >= 2:
+                should_process = True
+                print(f"Streaming: Noise detected, merging {len(session.text_chunks)} chunks: '{merged_text}'")
+        else:
+            # Chunk has text - add it
+            chunk_text = chunk_text.strip()
+            session.add_text_chunk(chunk_text)
+            print(f"Streaming: Chunk {len(session.audio_chunks)} transcribed: '{chunk_text}'")
+        
+        # Force processing if is_final flag is set
+        if is_final:
+            merged_text = session.get_merged_text()
+            if merged_text and len(merged_text.strip()) >= 2:
+                should_process = True
+                print(f"Streaming: Final chunk, processing merged text: '{merged_text}'")
+        
+        return jsonify({
+            "chunk_text": chunk_text or "",
+            "is_noise": is_noise,
+            "merged_text": merged_text,
+            "should_process": should_process,
+            "session_id": session_id,
+            "conversation_id": session.conversation_id
+        }), 200
+        
+    except Exception as e:
+        print(f"Error processing stream chunk: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/voice/stream/process', methods=['POST'])
+def process_streamed_text():
+    """
+    Process merged text from streaming session with LLM
+    Called when noise is detected or final chunk is received
+    
+    Request:
+        - session_id: Streaming session ID (required)
+        - merged_text: Merged text from chunks (required)
+    
+    Returns:
+        - text_response: LLM response
+        - audio_base64: TTS audio
+        - conversation_id: Conversation ID
+        - updates_applied: Personalization updates
+    """
+    try:
+        from backend.services.streaming_service import get_streaming_service
+        streaming_service = get_streaming_service()
+        
+        data = request.json
+        session_id = data.get('session_id')
+        merged_text = data.get('merged_text')
+        
+        if not session_id or not merged_text:
+            return jsonify({"error": "session_id and merged_text are required"}), 400
+        
+        session = streaming_service.get_session(session_id)
+        if not session:
+            return jsonify({"error": "Session not found"}), 404
+        
+        user_id = session.user_id
+        conversation_id = session.conversation_id
+        user_name = data.get('user_name')  # Optional
+        
+        # Get services
+        svcs = services()
+        
+        # Load conversation history
+        conversation = svcs['storage'].load_conversation(user_id, conversation_id)
+        conversation_history = conversation.get("messages", []) if conversation else []
+        
+        # Add user message
+        user_message = {
+            "role": "user",
+            "content": merged_text,
+            "timestamp": datetime.now().isoformat()
+        }
+        conversation_history.append(user_message)
+        
+        # Generate LLM response
+        print(f"Streaming LLM: Processing merged text: '{merged_text}'")
+        llm_result = svcs['llm'].generate_response(
+            user_id=user_id,
+            user_message=merged_text,
+            conversation_history=conversation_history,
+            user_name=user_name
+        )
+        
+        assistant_response = llm_result["response"]
+        updates_applied = llm_result.get("updates_applied", [])
+        
+        # Add assistant message
+        assistant_message = {
+            "role": "assistant",
+            "content": assistant_response,
+            "timestamp": datetime.now().isoformat()
+        }
+        conversation_history.append(assistant_message)
+        
+        # Save conversation
+        svcs['storage'].save_conversation(user_id, conversation_id, conversation_history)
+        
+        # Generate TTS
+        audio_response = None
+        if assistant_response:
+            try:
+                # Truncate long text for TTS (Groq has 200 char limit)
+                tts_text = assistant_response
+                if len(tts_text) > 200:
+                    # Try to find first sentence
+                    sentence_end = tts_text.find('.')
+                    if sentence_end > 0 and sentence_end < 200:
+                        tts_text = tts_text[:sentence_end + 1]
+                    else:
+                        # Just truncate to 200 chars
+                        tts_text = tts_text[:197] + "..."
+                    print(f"Streaming TTS: Text truncated to {len(tts_text)} chars for TTS")
+                
+                print(f"Streaming TTS: Generating audio for text (length: {len(tts_text)} chars)")
+                audio_response = svcs['tts'].synthesize_speech(text=tts_text)
+                if audio_response:
+                    print(f"Streaming TTS: Audio generated successfully: {len(audio_response)} bytes")
+                else:
+                    print("Streaming TTS: WARNING - Audio generation returned None")
+            except Exception as e:
+                print(f"Streaming TTS: Error generating audio: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Clear processed chunks from session
+        session.clear_text_chunks()
+        
+        # Build response
+        response_data = {
+            "text_response": assistant_response,
+            "conversation_id": conversation_id,
+            "updates_applied": updates_applied,
+            "user_text": merged_text,
+        }
+        
+        if audio_response:
+            import base64
+            audio_base64 = base64.b64encode(audio_response).decode('utf-8')
+            response_data["audio_base64"] = audio_base64
+        
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        print(f"Error processing streamed text: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/text/process', methods=['POST'])
 def process_text():
     """
@@ -442,15 +728,32 @@ def process_text():
         
         if generate_audio:
             print(f"TTS: Generating audio for greeting/initial message (length: {len(assistant_response)} chars)")
+            print(f"TTS: Available providers: {svcs['tts'].providers}")
             try:
+                # Split long text into sentences for TTS (Groq has 200 char limit)
+                # For greeting, use first sentence or truncate to 200 chars
+                tts_text = assistant_response
+                if len(tts_text) > 200:
+                    # Try to find first sentence
+                    sentence_end = tts_text.find('.')
+                    if sentence_end > 0 and sentence_end < 200:
+                        tts_text = tts_text[:sentence_end + 1]
+                    else:
+                        # Just truncate to 200 chars
+                        tts_text = tts_text[:197] + "..."
+                    print(f"TTS: Text truncated to {len(tts_text)} chars for TTS")
+                
+                print(f"TTS: Calling synthesize_speech with text: '{tts_text[:50]}...'")
                 audio_response = svcs['tts'].synthesize_speech(
-                    text=assistant_response
+                    text=tts_text
                 )
                 if audio_response:
-                    print(f"TTS: Greeting audio generated: {len(audio_response)} bytes")
+                    print(f"TTS: Greeting audio generated successfully: {len(audio_response)} bytes")
                 else:
-                    print("TTS: WARNING - Greeting audio generation failed")
+                    print("TTS: WARNING - Greeting audio generation returned None")
                     print("   Check GROQ_API_KEY in .env.local")
+                    print("   Check backend logs for TTS errors")
+                    print("   Available TTS providers:", svcs['tts'].providers)
             except Exception as e:
                 print(f"TTS: Error generating greeting audio: {e}")
                 import traceback

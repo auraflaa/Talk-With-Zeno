@@ -212,6 +212,15 @@ class TTSService:
             print("TTS: Empty text provided")
             return None
         
+        # Check cache first
+        from backend.services.cache_service import get_cache_service
+        cache = get_cache_service()
+        
+        cached_audio = cache.get('tts', text=text.strip().lower(), provider=preferred_provider or 'groq')
+        if cached_audio:
+            print(f"TTS: Cache hit for text: '{text[:50]}...' (audio size: {len(cached_audio)} bytes)")
+            return cached_audio
+        
         print(f"TTS: Attempting to synthesize speech (text length: {len(text)})")
         print(f"TTS: Available providers: {self.providers}")
         
@@ -236,6 +245,9 @@ class TTSService:
                 audio = self.synthesize_speech_groq(text)
                 if audio:
                     print(f"TTS: Success with Groq (audio size: {len(audio)} bytes)")
+                    # Cache the result
+                    cache.set('tts', audio, ttl_seconds=86400, text=text.strip().lower(), provider='groq')
+                    print(f"TTS: Cached audio for text: '{text[:50]}...'")
                     return audio
                 else:
                     print("TTS: Groq failed, trying next provider")
@@ -243,6 +255,9 @@ class TTSService:
                 audio = self.synthesize_speech_gemini(text)
                 if audio:
                     print(f"TTS: Success with Gemini (audio size: {len(audio)} bytes)")
+                    # Cache the result
+                    cache.set('tts', audio, ttl_seconds=86400, text=text.strip().lower(), provider='gemini')
+                    print(f"TTS: Cached audio for text: '{text[:50]}...'")
                     return audio
                 else:
                     print("TTS: Gemini failed, trying next provider")

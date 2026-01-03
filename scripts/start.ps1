@@ -8,7 +8,8 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-Set-Location $scriptDir
+$projectRoot = Split-Path -Parent $scriptDir
+Set-Location $projectRoot
 
 # Check Python installation
 Write-Host "Checking Python installation..." -ForegroundColor Yellow
@@ -96,7 +97,7 @@ if (-not (Test-Path ".\node_modules")) {
 Write-Host ""
 Write-Host "=== Starting Backend Server ===" -ForegroundColor Green
 $backendScript = @"
-cd '$scriptDir'
+cd '$projectRoot'
 Write-Host '=== Backend Server ===' -ForegroundColor Green
 Write-Host 'Running on http://localhost:5000' -ForegroundColor Cyan
 Write-Host 'Press Ctrl+C to stop' -ForegroundColor Gray
@@ -112,7 +113,7 @@ Start-Sleep -Seconds 3
 # Start Frontend Server
 Write-Host "=== Starting Frontend Server ===" -ForegroundColor Green
 $frontendScript = @"
-cd '$scriptDir'
+cd '$projectRoot'
 Write-Host '=== Frontend Server ===' -ForegroundColor Green
 Write-Host 'Running on http://localhost:5173' -ForegroundColor Cyan
 Write-Host 'Press Ctrl+C to stop' -ForegroundColor Gray

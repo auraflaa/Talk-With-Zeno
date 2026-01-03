@@ -18,6 +18,7 @@ dist-ssr
 
 # Google Cloud Service Account Keys
 service-account-key.json
+config/service-account-key.json
 *-service-account*.json
 *.json.key
 

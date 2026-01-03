@@ -1,10 +1,11 @@
 """
 End-to-end pipeline test
-Tests the complete STT -> LLM -> TTS pipeline
+Tests the complete STT -> LLM -> TTS pipeline with audio files and text input
 """
 
 import os
 import sys
+import argparse
 from pathlib import Path
 
 # Add parent directory to path
@@ -15,7 +16,9 @@ from dotenv import load_dotenv
 # Load environment variables
 env_path = Path(__file__).parent.parent / '.env.local'
 if env_path.exists():
-    load_dotenv(env_path)
+    load_dotenv(env_path, override=True)
+else:
+    load_dotenv('.env.local', override=True)
 
 from backend.services.stt_service import get_stt_service
 from backend.services.llm_service import get_llm_service
@@ -163,22 +166,154 @@ def test_storage():
     return True
 
 
+def test_stt_with_file(audio_file_path: str):
+    """Test STT with an audio file"""
+    print(f"\n{'='*60}")
+    print(f"Testing STT with file: {audio_file_path}")
+    print(f"{'='*60}")
+    
+    if not os.path.exists(audio_file_path):
+        print(f"ERROR: Audio file not found: {audio_file_path}")
+        return False
+    
+    stt_service = get_stt_service()
+    if not stt_service.client:
+        print("ERROR: STT client not initialized")
+        return False
+    
+    with open(audio_file_path, 'rb') as f:
+        audio_data = f.read()
+    
+    print(f"Audio file size: {len(audio_data)} bytes")
+    
+    audio_format = 'webm'
+    if audio_file_path.endswith('.wav'):
+        audio_format = 'wav'
+    elif audio_file_path.endswith('.mp3'):
+        audio_format = 'mp3'
+    
+    print(f"Audio format: {audio_format}")
+    print("Transcribing audio...")
+    transcript = stt_service.transcribe_audio(
+        audio_data,
+        language_code='en-US',
+        audio_format=audio_format
+    )
+    
+    if transcript:
+        print(f"✓ Transcription successful: '{transcript}'")
+        return True
+    else:
+        print("✗ Transcription failed - no text returned")
+        return False
+
+
+def test_full_audio_pipeline(audio_file_path: str):
+    """Test full pipeline with audio file: STT -> LLM -> TTS"""
+    print(f"\n{'='*60}")
+    print("Testing Full Audio Pipeline: STT -> LLM -> TTS")
+    print(f"{'='*60}")
+    
+    # Step 1: STT
+    stt_service = get_stt_service()
+    if not stt_service.client:
+        print("✗ STT service not available")
+        return False
+    
+    with open(audio_file_path, 'rb') as f:
+        audio_data = f.read()
+    
+    audio_format = 'webm'
+    if audio_file_path.endswith('.wav'):
+        audio_format = 'wav'
+    
+    print(f"Step 1: Transcribing audio ({len(audio_data)} bytes)...")
+    transcript = stt_service.transcribe_audio(
+        audio_data,
+        language_code='en-US',
+        audio_format=audio_format
+    )
+    
+    if not transcript:
+        print("✗ STT failed")
+        return False
+    print(f"✓ STT: '{transcript}'")
+    
+    # Step 2: LLM
+    print(f"\nStep 2: Generating LLM response...")
+    llm_service = get_llm_service()
+    if not llm_service.model:
+        print("✗ LLM service not available")
+        return False
+    
+    result = llm_service.generate_response(
+        user_id='test_user',
+        user_message=transcript,
+        conversation_history=[],
+        user_name='Test User'
+    )
+    
+    if not result or not result.get('response'):
+        print("✗ LLM failed")
+        return False
+    
+    llm_response = result['response']
+    print(f"✓ LLM: '{llm_response[:100]}...'")
+    
+    # Step 3: TTS
+    print(f"\nStep 3: Generating TTS audio...")
+    tts_service = get_tts_service()
+    if not tts_service.providers:
+        print("✗ TTS service not available")
+        return False
+    
+    audio_data = tts_service.synthesize_speech(text=llm_response)
+    
+    if audio_data:
+        output_file = 'test_pipeline_output.wav'
+        with open(output_file, 'wb') as f:
+            f.write(audio_data)
+        print(f"✓ TTS: Saved to {output_file} ({len(audio_data)} bytes)")
+        print(f"\n{'='*60}")
+        print("✓ Full audio pipeline test PASSED")
+        print(f"{'='*60}")
+        return True
+    else:
+        print("✗ TTS failed")
+        return False
+
+
 def main():
     """Run all pipeline tests"""
+    parser = argparse.ArgumentParser(description='Test pipeline components')
+    parser.add_argument('--audio', type=str, help='Path to audio file for testing')
+    parser.add_argument('--test', type=str, choices=['stt', 'text', 'voice', 'storage', 'full', 'all'], 
+                       default='all', help='Which test to run')
+    
+    args = parser.parse_args()
+    
     print("="*60)
     print("Talk With Zeno - Pipeline Test Suite")
     print("="*60)
     
     results = {}
     
-    # Test storage
-    results['storage'] = test_storage()
+    if args.test in ['storage', 'all']:
+        results['storage'] = test_storage()
     
-    # Test text pipeline
-    results['text'] = test_text_pipeline()
+    if args.test in ['text', 'all']:
+        results['text'] = test_text_pipeline()
     
-    # Test voice pipeline (availability check)
-    results['voice'] = test_voice_pipeline()
+    if args.test in ['voice', 'all']:
+        results['voice'] = test_voice_pipeline()
+    
+    if args.test == 'stt' and args.audio:
+        results['stt'] = test_stt_with_file(args.audio)
+    elif args.test == 'full' and args.audio:
+        results['full_audio'] = test_full_audio_pipeline(args.audio)
+    elif args.test == 'all' and args.audio:
+        results['stt'] = test_stt_with_file(args.audio)
+        results['full_audio'] = test_full_audio_pipeline(args.audio)
     
     # Summary
     print("\n" + "="*60)
@@ -187,9 +322,9 @@ def main():
     
     for test_name, result in results.items():
         status = "[OK]" if result else "[X]"
-        print(f"{status} {test_name.upper()} pipeline")
+        print(f"{status} {test_name.upper()}")
     
-    all_passed = all(results.values())
+    all_passed = all(results.values()) if results else False
     
     if all_passed:
         print("\n[OK] All pipeline tests passed!")

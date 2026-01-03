@@ -37,6 +37,12 @@ class ApiService {
     userName?: string
   ): Promise<VoiceResponse> {
     try {
+      // Check audio size before upload (10MB limit)
+      const MAX_AUDIO_SIZE = 10 * 1024 * 1024; // 10MB
+      if (audioBlob.size > MAX_AUDIO_SIZE) {
+        throw new Error(`Audio file too large (${(audioBlob.size / 1024 / 1024).toFixed(2)}MB). Maximum size is 10MB. Please record a shorter message.`);
+      }
+
       const formData = new FormData();
       // Use the actual blob type (webm) instead of forcing .wav
       const filename = audioBlob.type.includes('webm') ? 'audio.webm' : 'audio.wav';
@@ -54,16 +60,29 @@ class ApiService {
       console.log(`Backend URL: ${this.baseUrl}/api/voice/process`);
       console.log(`User ID: ${userId}, Conversation ID: ${conversationId || 'new'}`);
 
-      // Add timeout (60 seconds for voice processing)
+      // Add timeout (90 seconds for voice processing - STT chunk processing can take time)
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second timeout
+      const timeoutId = setTimeout(() => controller.abort(), 90000); // 90 second timeout
 
       const startTime = Date.now();
-      const response = await fetch(`${this.baseUrl}/api/voice/process`, {
-        method: 'POST',
-        body: formData,
-        signal: controller.signal,
-      });
+      let response: Response;
+      try {
+        response = await fetch(`${this.baseUrl}/api/voice/process`, {
+          method: 'POST',
+          body: formData,
+          signal: controller.signal,
+        });
+      } catch (error: any) {
+        clearTimeout(timeoutId);
+        // Check if it's a network error
+        if (error.name === 'AbortError') {
+          throw new Error('Voice processing timed out. The backend took too long to respond. Please try again.');
+        }
+        if (error.message?.includes('fetch') || error.message?.includes('network') || error.message?.includes('Failed to fetch')) {
+          throw new Error('Cannot connect to backend server. Please ensure the backend is running on http://localhost:5000');
+        }
+        throw error;
+      }
 
       clearTimeout(timeoutId);
       const duration = Date.now() - startTime;
@@ -95,11 +114,13 @@ class ApiService {
       return responseData;
     } catch (error) {
       console.error('Error in processVoice:', error);
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw new Error('Voice processing timed out. The backend took too long to respond. Please try again.');
-      }
-      if (error instanceof TypeError && error.message.includes('fetch')) {
-        throw new Error('Cannot connect to backend server. Please ensure the backend is running on http://localhost:5000');
+      if (error instanceof Error) {
+        if (error.name === 'AbortError') {
+          throw new Error('Voice processing timed out. The backend took too long to respond. Please try again.');
+        }
+        if (error.message.includes('fetch') || error.message.includes('network') || error.message.includes('Failed to fetch')) {
+          throw new Error('Cannot connect to backend server. Please ensure the backend is running on http://localhost:5000');
+        }
       }
       throw error;
     }
@@ -191,14 +212,165 @@ class ApiService {
       const timeoutId = setTimeout(() => controller.abort(), 3000); // 3 second timeout
       
       const response = await fetch(`${this.baseUrl}/api/health`, {
-        signal: controller.signal
+        signal: controller.signal,
+        cache: 'no-cache' // Prevent caching of health check
       });
       
       clearTimeout(timeoutId);
       return response.ok;
     } catch (error) {
-      console.log('Health check failed:', error instanceof Error ? error.message : 'Unknown error');
+      // Don't log every health check failure to reduce console spam
+      // Only log if it's not an abort error (which is expected for timeouts)
+      if (error instanceof Error && error.name !== 'AbortError') {
+        console.log('Health check failed:', error.message);
+      }
       return false;
+    }
+  }
+
+  /**
+   * Create a new streaming session
+   */
+  async createStreamingSession(
+    userId: string,
+    conversationId?: string,
+    languageCode: string = 'en-US'
+  ): Promise<string> {
+    try {
+      const response = await fetch(`${this.baseUrl}/api/voice/stream/chunk`, {
+        method: 'POST',
+        body: new FormData(), // Empty initial request to create session
+        headers: {
+          'X-Create-Session': 'true',
+          'X-User-Id': userId,
+          'X-Conversation-Id': conversationId || '',
+          'X-Language-Code': languageCode,
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to create streaming session');
+      }
+
+      const data = await response.json();
+      return data.session_id;
+    } catch (error) {
+      console.error('Error creating streaming session:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Send an audio chunk for streaming STT processing
+   */
+  async processStreamChunk(
+    audioBlob: Blob,
+    sessionId: string,
+    userId: string,
+    conversationId?: string,
+    languageCode: string = 'en-US',
+    isFinal: boolean = false
+  ): Promise<{
+    chunk_text: string;
+    is_noise: boolean;
+    merged_text: string;
+    should_process: boolean;
+    session_id: string;
+    conversation_id: string;
+  }> {
+    try {
+      const formData = new FormData();
+      const filename = audioBlob.type.includes('webm') ? 'audio.webm' : 'audio.wav';
+      formData.append('audio', audioBlob, filename);
+      if (sessionId && sessionId !== 'pending') {
+        formData.append('session_id', sessionId);
+      }
+      formData.append('user_id', userId);
+      formData.append('language_code', languageCode);
+      formData.append('is_final', isFinal.toString());
+      if (conversationId) {
+        formData.append('conversation_id', conversationId);
+      }
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => {
+        if (!controller.signal.aborted) {
+          controller.abort();
+        }
+      }, 20000); // 20 second timeout per chunk (STT can take time)
+
+      let response: Response;
+      try {
+        response = await fetch(`${this.baseUrl}/api/voice/stream/chunk`, {
+          method: 'POST',
+          body: formData,
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+      } catch (error) {
+        clearTimeout(timeoutId);
+        // Re-throw if it's not an abort error
+        if (error instanceof Error && error.name === 'AbortError') {
+          throw new Error('Request timeout - STT took too long to process chunk');
+        }
+        throw error;
+      }
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(errorData.error || 'Failed to process stream chunk');
+      }
+
+      return await response.json();
+    } catch (error) {
+      console.error('Error processing stream chunk:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Process merged text from streaming session with LLM
+   */
+  async processStreamedText(
+    sessionId: string,
+    mergedText: string,
+    userName?: string
+  ): Promise<VoiceResponse> {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second timeout
+
+      const response = await fetch(`${this.baseUrl}/api/voice/stream/process`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          session_id: sessionId,
+          merged_text: mergedText,
+          user_name: userName,
+        }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(errorData.error || 'Failed to process streamed text');
+      }
+
+      const responseData = await response.json();
+      console.log('Streaming LLM response received:', {
+        hasTextResponse: !!responseData.text_response,
+        hasAudioBase64: !!responseData.audio_base64,
+        textLength: responseData.text_response?.length || 0,
+        audioBase64Length: responseData.audio_base64?.length || 0
+      });
+      return responseData;
+    } catch (error) {
+      console.error('Error processing streamed text:', error);
+      throw error;
     }
   }
 }

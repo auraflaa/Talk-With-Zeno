@@ -25,6 +25,19 @@ class STTService:
         try:
             # Try to use service account credentials if available
             creds_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+            
+            # Also check config folder
+            if not creds_path or not os.path.exists(creds_path):
+                config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'service-account-key.json')
+                if os.path.exists(config_path):
+                    creds_path = config_path
+            
+            # Also check root
+            if not creds_path or not os.path.exists(creds_path):
+                root_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'service-account-key.json')
+                if os.path.exists(root_path):
+                    creds_path = root_path
+            
             if creds_path and os.path.exists(creds_path):
                 credentials = service_account.Credentials.from_service_account_file(creds_path)
                 self.client = speech.SpeechClient(credentials=credentials)
@@ -34,7 +47,41 @@ class STTService:
             print("STT: Google Speech-to-Text client initialized")
         except Exception as e:
             print(f"Warning: Could not initialize STT client: {e}")
-            print("STT will not be available. Make sure GOOGLE_APPLICATION_CREDENTIALS is set.")
+            print("STT will not be available. Make sure GOOGLE_APPLICATION_CREDENTIALS is set or service-account-key.json exists in config/ or root.")
+    
+    def _detect_wav_sample_rate(self, audio_data: bytes) -> Optional[int]:
+        """
+        Detect sample rate from WAV file header
+        
+        Args:
+            audio_data: Raw WAV file bytes
+            
+        Returns:
+            Sample rate in Hz or None if detection fails
+        """
+        try:
+            if len(audio_data) < 44:  # WAV header is at least 44 bytes
+                return None
+            
+            # Check for RIFF header
+            if audio_data[0:4] != b'RIFF' or audio_data[8:12] != b'WAVE':
+                return None
+            
+            # Find 'fmt ' chunk
+            fmt_pos = audio_data.find(b'fmt ')
+            if fmt_pos == -1:
+                return None
+            
+            # Sample rate is at offset 24 from start of 'fmt ' chunk
+            # Or at byte 24-27 in standard WAV header
+            if fmt_pos + 24 < len(audio_data):
+                sample_rate = struct.unpack('<I', audio_data[fmt_pos + 12:fmt_pos + 16])[0]
+                return sample_rate
+            
+            return None
+        except Exception as e:
+            print(f"STT: Error detecting WAV sample rate: {e}")
+            return None
     
     def transcribe_audio(self, audio_data: bytes, language_code: str = "en-US", 
                         sample_rate: int = 16000, audio_format: str = "webm") -> Optional[str]:
@@ -44,7 +91,7 @@ class STTService:
         Args:
             audio_data: Raw audio bytes
             language_code: Language code (default: en-US)
-            sample_rate: Audio sample rate in Hz (default: 16000)
+            sample_rate: Audio sample rate in Hz (default: 16000, auto-detected for WAV)
             audio_format: Audio format ('webm', 'wav', 'linear16')
             
         Returns:
@@ -55,10 +102,25 @@ class STTService:
             return None
         
         if not audio_data or len(audio_data) == 0:
-            print("STT: Empty audio data")
+            print("STT: Empty audio data - returning None (this is expected for noise detection)")
+            return None
+        
+        # Very small audio chunks are likely noise/silence
+        if len(audio_data) < 100:
+            print(f"STT: Audio too small ({len(audio_data)} bytes) - likely noise/silence")
             return None
         
         try:
+            # Auto-detect sample rate for WAV files
+            detected_sample_rate = sample_rate
+            if audio_format.lower() == 'wav':
+                detected = self._detect_wav_sample_rate(audio_data)
+                if detected:
+                    detected_sample_rate = detected
+                    print(f"STT: Detected WAV sample rate: {detected_sample_rate} Hz")
+                else:
+                    print(f"STT: Could not detect WAV sample rate, using provided: {sample_rate} Hz")
+            
             # Try multiple encoding strategies for WebM/Opus
             encoding_strategies = []
             
@@ -86,16 +148,17 @@ class STTService:
                     'name': 'ENCODING_UNSPECIFIED (auto-detect)'
                 })
             elif audio_format.lower() == 'wav':
+                # Use LINEAR16 encoding with detected sample rate
                 encoding_strategies.append({
                     'encoding': speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                    'sample_rate': sample_rate,
-                    'name': 'LINEAR16'
+                    'sample_rate': detected_sample_rate,
+                    'name': f'LINEAR16 ({detected_sample_rate} Hz)'
                 })
             else:
                 # Default: auto-detect
                 encoding_strategies.append({
                     'encoding': speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED,
-                    'sample_rate': sample_rate,
+                    'sample_rate': detected_sample_rate,
                     'name': 'ENCODING_UNSPECIFIED'
                 })
             
@@ -109,7 +172,7 @@ class STTService:
                         sample_rate_hertz=strategy['sample_rate'],
                         language_code=language_code,
                         enable_automatic_punctuation=True,
-                        model='latest_long',  # Use latest model for better accuracy
+                        model='phone_call',  # Optimized for voice conversations (1747ms avg latency)
                     )
                     
                     audio = speech.RecognitionAudio(content=audio_data)
@@ -170,28 +233,41 @@ class STTService:
         
         all_transcripts = []
         
-        # Process each chunk
+        # Process chunks in parallel for better performance (using ThreadPoolExecutor)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         successful_chunks = 0
-        for i, chunk_data in enumerate(audio_chunks):
-            if not chunk_data or len(chunk_data) < 500:  # Skip very small chunks
-                print(f"STT: Skipping chunk {i+1} - too small ({len(chunk_data)} bytes)")
-                continue
-            
-            print(f"STT: Processing chunk {i+1}/{len(audio_chunks)} (size: {len(chunk_data)} bytes)")
+        
+        def process_chunk(i: int, chunk_data: bytes) -> tuple[int, Optional[str]]:
+            """Process a single chunk and return (index, transcript)"""
+            if not chunk_data or len(chunk_data) < 500:
+                return (i, None)
             try:
                 chunk_text = self.transcribe_audio(chunk_data, language_code, audio_format=audio_format)
-                
-                if chunk_text and chunk_text.strip():
-                    print(f"STT: Chunk {i+1} transcribed: '{chunk_text}'")
-                    all_transcripts.append(chunk_text.strip())
-                    successful_chunks += 1
-                else:
-                    print(f"STT: Chunk {i+1} returned no transcription (likely silence or noise)")
+                return (i, chunk_text.strip() if chunk_text else None)
             except Exception as e:
                 print(f"STT: Error processing chunk {i+1}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+                return (i, None)
+        
+        # Process chunks in parallel (max 4 concurrent requests to avoid rate limits)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_chunk = {
+                executor.submit(process_chunk, i, chunk_data): i 
+                for i, chunk_data in enumerate(audio_chunks)
+            }
+            
+            # Collect results as they complete
+            chunk_results = {}
+            for future in as_completed(future_to_chunk):
+                chunk_idx, transcript = future.result()
+                if transcript:
+                    chunk_results[chunk_idx] = transcript
+                    successful_chunks += 1
+                    print(f"STT: Chunk {chunk_idx+1} transcribed: '{transcript}'")
+                else:
+                    print(f"STT: Chunk {chunk_idx+1} returned no transcription (likely silence or noise)")
+        
+        # Sort transcripts by chunk index to maintain order
+        all_transcripts = [chunk_results[i] for i in sorted(chunk_results.keys())]
         
         print(f"STT: Successfully transcribed {successful_chunks}/{len(audio_chunks)} chunks")
         

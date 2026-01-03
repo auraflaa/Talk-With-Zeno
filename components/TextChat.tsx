@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { Send, Mic, X } from 'lucide-react';
 import { Message } from '../types';
+import { MarkdownMessage } from './MarkdownMessage';
 
 interface TextChatProps {
     messages: Message[];
@@ -68,7 +69,11 @@ export const TextChat: React.FC<TextChatProps> = ({ messages, onSendMessage, onS
                                     : 'bg-base-200 text-base-content border border-base-200'
                                 }`}
                             >
-                                {msg.content}
+                                {msg.role === 'assistant' ? (
+                                    <MarkdownMessage content={msg.content} />
+                                ) : (
+                                    <span className="whitespace-pre-wrap">{msg.content}</span>
+                                )}
                             </div>
                         </div>
                     ))}

@@ -101,6 +101,37 @@
       *:focus-visible {
         outline: none;
       }
+
+      /* Markdown content styles */
+      .markdown-content {
+        word-wrap: break-word;
+        overflow-wrap: break-word;
+      }
+
+      .markdown-content * {
+        max-width: 100%;
+      }
+
+      /* Ensure markdown content in chat bubbles doesn't overflow */
+      .chat-bubble .markdown-content {
+        overflow: visible;
+      }
+
+      /* Code block styling in dark mode */
+      html.dark .markdown-content code {
+        background-color: rgba(0, 0, 0, 0.3);
+      }
+
+      /* Table styling */
+      .markdown-content table {
+        font-size: 0.9em;
+      }
+
+      /* List styling */
+      .markdown-content ul,
+      .markdown-content ol {
+        padding-left: 1.5rem;
+      }
     </style>
     
   <script type="importmap">
