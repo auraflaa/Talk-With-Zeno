@@ -15,9 +15,19 @@ requests>=2.31.0
 google-cloud-speech>=2.21.0
 google-generativeai>=0.3.0
 
-# Groq SDK for TTS
+# Groq SDK for TTS and STT (Whisper models)
 groq>=1.0.0
 
+# Error monitoring and logging
+sentry-sdk[flask]>=2.0.0
+
+# Voice Activity Detection (optional, for backend VAD)
+# silero-vad>=4.0.0  # Highest accuracy, ML-based (recommended)
+# torch>=2.0.0  # Required for silero-vad
+# webrtcvad>=2.0.10  # Faster fallback option (lighter, less accurate)
+
 # Note: SQLite is built into Python, no installation needed!
-# Note: Groq API key needed for TTS (set GROQ_API_KEY in .env.local)
+# Note: Groq API key needed for TTS and STT (set GROQ_API_KEY in .env.local)
+# Note: Google credentials needed for STT fallback (set GOOGLE_APPLICATION_CREDENTIALS)
+# Note: webrtcvad is optional - install with: pip install webrtcvad
 

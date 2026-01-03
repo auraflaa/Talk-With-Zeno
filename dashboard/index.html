@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Talk With Zeno - Performance Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .metric-card {
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .metric-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <!-- Header -->
+        <div class="mb-8">
+            <h1 class="text-4xl font-bold text-gray-800 mb-2">Talk With Zeno - Performance Dashboard</h1>
+            <p class="text-gray-600">Real-time monitoring of model and pipeline performance</p>
+            <div class="mt-4 flex gap-4 items-center">
+                <select id="timeRange" class="px-4 py-2 border rounded-lg">
+                    <option value="1">Last 1 hour</option>
+                    <option value="6">Last 6 hours</option>
+                    <option value="24" selected>Last 24 hours</option>
+                    <option value="168">Last 7 days</option>
+                </select>
+                <button id="refreshBtn" class="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+                    Refresh
+                </button>
+                <span id="lastUpdate" class="text-sm text-gray-500"></span>
+            </div>
+        </div>
+
+        <!-- Summary Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+            <!-- STT Card -->
+            <div class="metric-card bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-lg font-semibold text-gray-700 mb-2">STT Service</h3>
+                <div class="text-3xl font-bold text-blue-600 mb-1" id="sttCalls">0</div>
+                <div class="text-sm text-gray-600">Total Calls</div>
+                <div class="mt-2 text-sm">
+                    <span class="text-green-600" id="sttSuccessRate">0%</span> success rate
+                </div>
+                <div class="mt-1 text-sm text-gray-500">
+                    Avg: <span id="sttAvgLatency">0</span>ms
+                </div>
+            </div>
+
+            <!-- LLM Card -->
+            <div class="metric-card bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-lg font-semibold text-gray-700 mb-2">LLM Service</h3>
+                <div class="text-3xl font-bold text-purple-600 mb-1" id="llmCalls">0</div>
+                <div class="text-sm text-gray-600">Total Calls</div>
+                <div class="mt-2 text-sm">
+                    <span class="text-green-600" id="llmSuccessRate">0%</span> success rate
+                </div>
+                <div class="mt-1 text-sm text-gray-500">
+                    Avg: <span id="llmAvgLatency">0</span>ms
+                </div>
+            </div>
+
+            <!-- TTS Card -->
+            <div class="metric-card bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-lg font-semibold text-gray-700 mb-2">TTS Service</h3>
+                <div class="text-3xl font-bold text-green-600 mb-1" id="ttsCalls">0</div>
+                <div class="text-sm text-gray-600">Total Calls</div>
+                <div class="mt-2 text-sm">
+                    <span class="text-green-600" id="ttsSuccessRate">0%</span> success rate
+                </div>
+                <div class="mt-1 text-sm text-gray-500">
+                    Avg: <span id="ttsAvgLatency">0</span>ms
+                </div>
+            </div>
+
+            <!-- Pipeline Card -->
+            <div class="metric-card bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-lg font-semibold text-gray-700 mb-2">Pipeline</h3>
+                <div class="text-3xl font-bold text-orange-600 mb-1" id="pipelineCalls">0</div>
+                <div class="text-sm text-gray-600">Total Calls</div>
+                <div class="mt-2 text-sm">
+                    <span class="text-green-600" id="pipelineSuccessRate">0%</span> success rate
+                </div>
+                <div class="mt-1 text-sm text-gray-500">
+                    Avg: <span id="pipelineAvgLatency">0</span>ms
+                </div>
+            </div>
+        </div>
+
+        <!-- Charts Row 1 -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+            <!-- Latency Over Time -->
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-xl font-semibold text-gray-800 mb-4">Pipeline Latency Over Time</h3>
+                <canvas id="latencyChart"></canvas>
+            </div>
+
+            <!-- Call Volume Over Time -->
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-xl font-semibold text-gray-800 mb-4">Call Volume Over Time</h3>
+                <canvas id="volumeChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Charts Row 2 -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+            <!-- Model Distribution -->
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-xl font-semibold text-gray-800 mb-4">LLM Model Usage</h3>
+                <canvas id="llmModelChart"></canvas>
+            </div>
+
+            <!-- Service Latency Breakdown -->
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-xl font-semibold text-gray-800 mb-4">Service Latency Breakdown</h3>
+                <canvas id="serviceLatencyChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Model Statistics Table -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+            <h3 class="text-xl font-semibold text-gray-800 mb-4">Model Performance Statistics</h3>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Service</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Model</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Calls</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Avg Latency (ms)</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Min Latency (ms)</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Max Latency (ms)</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Success Rate</th>
+                        </tr>
+                    </thead>
+                    <tbody id="modelStatsTable" class="bg-white divide-y divide-gray-200">
+                        <tr>
+                            <td colspan="7" class="px-6 py-4 text-center text-gray-500">Loading...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Error Statistics -->
+        <div class="bg-white rounded-lg shadow-md p-6">
+            <h3 class="text-xl font-semibold text-gray-800 mb-4">Error Statistics</h3>
+            <div id="errorStats" class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div class="text-center p-4 bg-red-50 rounded-lg">
+                    <div class="text-2xl font-bold text-red-600" id="totalErrors">0</div>
+                    <div class="text-sm text-gray-600">Total Errors</div>
+                </div>
+                <div class="text-center p-4 bg-yellow-50 rounded-lg">
+                    <div class="text-2xl font-bold text-yellow-600" id="sttErrors">0</div>
+                    <div class="text-sm text-gray-600">STT Errors</div>
+                </div>
+                <div class="text-center p-4 bg-orange-50 rounded-lg">
+                    <div class="text-2xl font-bold text-orange-600" id="llmErrors">0</div>
+                    <div class="text-sm text-gray-600">LLM Errors</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE_URL = 'http://localhost:5000';
+        let charts = {};
+
+        // Initialize charts
+        function initCharts() {
+            // Latency Chart
+            const latencyCtx = document.getElementById('latencyChart').getContext('2d');
+            charts.latency = new Chart(latencyCtx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'Total Latency (ms)',
+                            data: [],
+                            borderColor: 'rgb(59, 130, 246)',
+                            backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                            tension: 0.4
+                        },
+                        {
+                            label: 'STT Latency (ms)',
+                            data: [],
+                            borderColor: 'rgb(34, 197, 94)',
+                            backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                            tension: 0.4
+                        },
+                        {
+                            label: 'LLM Latency (ms)',
+                            data: [],
+                            borderColor: 'rgb(168, 85, 247)',
+                            backgroundColor: 'rgba(168, 85, 247, 0.1)',
+                            tension: 0.4
+                        },
+                        {
+                            label: 'TTS Latency (ms)',
+                            data: [],
+                            borderColor: 'rgb(249, 115, 22)',
+                            backgroundColor: 'rgba(249, 115, 22, 0.1)',
+                            tension: 0.4
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: { position: 'top' }
+                    },
+                    scales: {
+                        y: { beginAtZero: true, title: { display: true, text: 'Latency (ms)' } }
+                    }
+                }
+            });
+
+            // Volume Chart
+            const volumeCtx = document.getElementById('volumeChart').getContext('2d');
+            charts.volume = new Chart(volumeCtx, {
+                type: 'bar',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'STT Calls',
+                            data: [],
+                            backgroundColor: 'rgba(59, 130, 246, 0.6)'
+                        },
+                        {
+                            label: 'LLM Calls',
+                            data: [],
+                            backgroundColor: 'rgba(168, 85, 247, 0.6)'
+                        },
+                        {
+                            label: 'TTS Calls',
+                            data: [],
+                            backgroundColor: 'rgba(34, 197, 94, 0.6)'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: { position: 'top' }
+                    },
+                    scales: {
+                        y: { beginAtZero: true, title: { display: true, text: 'Number of Calls' } }
+                    }
+                }
+            });
+
+            // LLM Model Chart
+            const llmModelCtx = document.getElementById('llmModelChart').getContext('2d');
+            charts.llmModel = new Chart(llmModelCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        data: [],
+                        backgroundColor: [
+                            'rgba(59, 130, 246, 0.8)',
+                            'rgba(168, 85, 247, 0.8)',
+                            'rgba(34, 197, 94, 0.8)',
+                            'rgba(249, 115, 22, 0.8)',
+                            'rgba(236, 72, 153, 0.8)'
+                        ]
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: { position: 'right' }
+                    }
+                }
+            });
+
+            // Service Latency Chart
+            const serviceLatencyCtx = document.getElementById('serviceLatencyChart').getContext('2d');
+            charts.serviceLatency = new Chart(serviceLatencyCtx, {
+                type: 'bar',
+                data: {
+                    labels: ['STT', 'LLM', 'TTS'],
+                    datasets: [{
+                        label: 'Average Latency (ms)',
+                        data: [0, 0, 0],
+                        backgroundColor: [
+                            'rgba(59, 130, 246, 0.8)',
+                            'rgba(168, 85, 247, 0.8)',
+                            'rgba(34, 197, 94, 0.8)'
+                        ]
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: { display: false }
+                    },
+                    scales: {
+                        y: { beginAtZero: true, title: { display: true, text: 'Latency (ms)' } }
+                    }
+                }
+            });
+        }
+
+        // Fetch and update data
+        async function fetchData() {
+            const hours = parseInt(document.getElementById('timeRange').value);
+            
+            try {
+                // Fetch summary
+                const summaryRes = await fetch(`${API_BASE_URL}/api/metrics/summary?hours=${hours}`);
+                const summary = await summaryRes.json();
+                
+                // Update summary cards
+                updateSummaryCards(summary);
+                
+                // Fetch time series
+                const timeseriesRes = await fetch(`${API_BASE_URL}/api/metrics/timeseries?type=pipeline_calls&hours=${hours}&group_by=minute`);
+                const timeseries = await timeseriesRes.json();
+                
+                // Update charts
+                updateCharts(timeseries.data, summary);
+                
+                // Update model stats table
+                updateModelStatsTable(summary);
+                
+                // Update last update time
+                document.getElementById('lastUpdate').textContent = 
+                    `Last updated: ${new Date().toLocaleTimeString()}`;
+                
+            } catch (error) {
+                console.error('Error fetching metrics:', error);
+                document.getElementById('lastUpdate').textContent = 
+                    `Error: ${error.message}`;
+            }
+        }
+
+        function updateSummaryCards(summary) {
+            // STT
+            const stt = summary.stt?.overall || {};
+            document.getElementById('sttCalls').textContent = stt.count || 0;
+            document.getElementById('sttSuccessRate').textContent = 
+                `${(stt.success_rate * 100).toFixed(1)}%`;
+            document.getElementById('sttAvgLatency').textContent = 
+                Math.round(stt.avg_latency_ms || 0);
+            
+            // LLM
+            const llm = summary.llm?.overall || {};
+            document.getElementById('llmCalls').textContent = llm.count || 0;
+            document.getElementById('llmSuccessRate').textContent = 
+                `${(llm.success_rate * 100).toFixed(1)}%`;
+            document.getElementById('llmAvgLatency').textContent = 
+                Math.round(llm.avg_latency_ms || 0);
+            
+            // TTS
+            const tts = summary.tts?.overall || {};
+            document.getElementById('ttsCalls').textContent = tts.count || 0;
+            document.getElementById('ttsSuccessRate').textContent = 
+                `${(tts.success_rate * 100).toFixed(1)}%`;
+            document.getElementById('ttsAvgLatency').textContent = 
+                Math.round(tts.avg_latency_ms || 0);
+            
+            // Pipeline
+            const pipeline = summary.pipeline?.overall || {};
+            document.getElementById('pipelineCalls').textContent = pipeline.count || 0;
+            document.getElementById('pipelineSuccessRate').textContent = 
+                `${(pipeline.success_rate * 100).toFixed(1)}%`;
+            document.getElementById('pipelineAvgLatency').textContent = 
+                Math.round(pipeline.avg_latency_ms || 0);
+            
+            // Errors
+            const errors = summary.errors || {};
+            document.getElementById('totalErrors').textContent = errors.total || 0;
+            document.getElementById('sttErrors').textContent = errors.by_service?.stt || 0;
+            document.getElementById('llmErrors').textContent = errors.by_service?.llm || 0;
+        }
+
+        function updateCharts(timeseriesData, summary) {
+            // Update latency chart
+            if (charts.latency && timeseriesData.length > 0) {
+                charts.latency.data.labels = timeseriesData.map(d => d.time);
+                charts.latency.data.datasets[0].data = timeseriesData.map(d => d.avg_latency_ms);
+                charts.latency.update();
+            }
+            
+            // Update volume chart
+            if (charts.volume && timeseriesData.length > 0) {
+                charts.volume.data.labels = timeseriesData.map(d => d.time);
+                charts.volume.data.datasets[0].data = timeseriesData.map(d => d.count);
+                charts.volume.update();
+            }
+            
+            // Update LLM model chart
+            if (charts.llmModel && summary.llm?.by_model) {
+                const models = Object.keys(summary.llm.by_model);
+                const counts = models.map(m => summary.llm.by_model[m].count);
+                charts.llmModel.data.labels = models;
+                charts.llmModel.data.datasets[0].data = counts;
+                charts.llmModel.update();
+            }
+            
+            // Update service latency chart
+            if (charts.serviceLatency && summary.pipeline?.latency_breakdown) {
+                const breakdown = summary.pipeline.latency_breakdown;
+                charts.serviceLatency.data.datasets[0].data = [
+                    Math.round(breakdown.avg_stt_ms || 0),
+                    Math.round(breakdown.avg_llm_ms || 0),
+                    Math.round(breakdown.avg_tts_ms || 0)
+                ];
+                charts.serviceLatency.update();
+            }
+        }
+
+        function updateModelStatsTable(summary) {
+            const tbody = document.getElementById('modelStatsTable');
+            tbody.innerHTML = '';
+            
+            // STT Models
+            if (summary.stt?.by_model) {
+                for (const [model, stats] of Object.entries(summary.stt.by_model)) {
+                    const row = createTableRow('STT', model, stats);
+                    tbody.appendChild(row);
+                }
+            }
+            
+            // LLM Models
+            if (summary.llm?.by_model) {
+                for (const [model, stats] of Object.entries(summary.llm.by_model)) {
+                    const row = createTableRow('LLM', model, stats);
+                    tbody.appendChild(row);
+                }
+            }
+            
+            // TTS Providers
+            if (summary.tts?.by_provider) {
+                for (const [provider, stats] of Object.entries(summary.tts.by_provider)) {
+                    const row = createTableRow('TTS', provider, stats);
+                    tbody.appendChild(row);
+                }
+            }
+            
+            if (tbody.children.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="px-6 py-4 text-center text-gray-500">No data available</td></tr>';
+            }
+        }
+
+        function createTableRow(service, model, stats) {
+            const row = document.createElement('tr');
+            row.className = 'hover:bg-gray-50';
+            row.innerHTML = `
+                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${service}</td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${model}</td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${stats.count || 0}</td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${Math.round(stats.avg_latency_ms || 0)}</td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${Math.round(stats.min_latency_ms || 0)}</td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${Math.round(stats.max_latency_ms || 0)}</td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                    <span class="px-2 py-1 rounded-full ${stats.success_rate >= 0.95 ? 'bg-green-100 text-green-800' : stats.success_rate >= 0.8 ? 'bg-yellow-100 text-yellow-800' : 'bg-red-100 text-red-800'}">
+                        ${(stats.success_rate * 100).toFixed(1)}%
+                    </span>
+                </td>
+            `;
+            return row;
+        }
+
+        // Event listeners
+        document.getElementById('refreshBtn').addEventListener('click', fetchData);
+        document.getElementById('timeRange').addEventListener('change', fetchData);
+
+        // Initialize and start auto-refresh
+        initCharts();
+        fetchData();
+        setInterval(fetchData, 10000); // Refresh every 10 seconds
+    </script>
+</body>
+</html>
+

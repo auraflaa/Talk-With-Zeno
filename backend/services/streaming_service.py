@@ -45,11 +45,17 @@ class StreamingSession:
             self.pending_chunks.append(audio_data)
     
     def add_text_chunk(self, text: str) -> None:
-        """Add a transcribed text chunk"""
+        """Add a transcribed text chunk (prevents duplicates)"""
         with self.lock:
             if text and text.strip():
-                self.text_chunks.append(text.strip())
-                self.last_activity = datetime.now()
+                text_stripped = text.strip()
+                # Prevent duplicate consecutive chunks
+                if not self.text_chunks or self.text_chunks[-1] != text_stripped:
+                    self.text_chunks.append(text_stripped)
+                    self.last_activity = datetime.now()
+                else:
+                    # Duplicate detected, skip adding
+                    print(f"StreamingService: Skipping duplicate text chunk: '{text_stripped[:50]}...'")
     
     def get_pending_chunks(self) -> List[bytes]:
         """Get and clear pending chunks"""
@@ -59,14 +65,25 @@ class StreamingSession:
             return chunks
     
     def get_merged_text(self) -> str:
-        """Get merged text from all text chunks"""
+        """Get merged text from all text chunks (removes duplicates)"""
         with self.lock:
             if not self.text_chunks:
                 return ""
-            # Merge with spaces, remove duplicates at boundaries
-            merged = " ".join(self.text_chunks)
+            
+            # Remove exact duplicates while preserving order
+            seen = set()
+            unique_chunks = []
+            for chunk in self.text_chunks:
+                # Normalize for comparison (lowercase, no punctuation)
+                import re
+                normalized = re.sub(r'[.!?,;:\s]+', ' ', chunk.lower()).strip()
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    unique_chunks.append(chunk)
+            
+            # Merge with spaces
+            merged = " ".join(unique_chunks)
             # Clean up multiple spaces
-            import re
             merged = re.sub(r'\s+', ' ', merged).strip()
             return merged
     

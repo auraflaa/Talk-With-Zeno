@@ -19,6 +19,14 @@ else:
     # Try current directory
     load_dotenv('.env.local')
 
+# Initialize Sentry before importing app
+from backend.services.sentry_service import init_sentry
+sentry_initialized = init_sentry()
+
+# Initialize logger
+from backend.services.logger_service import get_logger
+logger = get_logger()
+
 # Import app after environment is loaded
 from backend.app import app
 
@@ -27,8 +35,13 @@ if __name__ == '__main__':
     host = os.getenv('HOST', '0.0.0.0')
     debug = os.getenv('FLASK_DEBUG', 'True').lower() == 'true'
     
-    print(f"Starting Talk With Zeno backend on {host}:{port}")
-    print(f"Debug mode: {debug}")
+    logger.info(f"Starting Talk With Zeno backend on {host}:{port}")
+    logger.info(f"Debug mode: {debug}")
+    logger.info(f"Log level: {os.getenv('LOG_LEVEL', 'INFO')}")
+    if sentry_initialized:
+        logger.info("Sentry error monitoring: Enabled")
+    else:
+        logger.info("Sentry error monitoring: Disabled (SENTRY_DSN not set)")
     
     app.run(debug=debug, host=host, port=port)
 

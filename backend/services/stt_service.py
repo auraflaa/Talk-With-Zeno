@@ -1,6 +1,7 @@
 """
-Google Speech-to-Text Service
+Speech-to-Text Service
 Converts audio/voice input to text
+Uses Groq Whisper models (primary) with Google STT as fallback
 Supports chunk-wise processing for better accuracy
 """
 
@@ -12,16 +13,44 @@ from typing import Optional, BinaryIO, List
 import wave
 import struct
 
+# Try to import Groq SDK
+try:
+    from groq import Groq
+    GROQ_SDK_AVAILABLE = True
+except ImportError:
+    GROQ_SDK_AVAILABLE = False
+    Groq = None
+
 
 class STTService:
-    """Google Speech-to-Text service"""
+    """STT service with Groq Whisper (primary) and Google STT (fallback)"""
     
     def __init__(self):
-        self.client = None
-        self._initialize_client()
+        self.groq_api_key = os.getenv('GROQ_API_KEY') or os.getenv('VITE_GROQ_API_KEY')
+        self.groq_client = None
+        self.google_client = None
+        self.preferred_model = "whisper-large-v3-turbo"  # Faster option
+        self.fallback_model = "whisper-large-v3"  # More accurate option
+        self._initialize_clients()
     
-    def _initialize_client(self):
-        """Initialize Google Speech-to-Text client"""
+    def _initialize_clients(self):
+        """Initialize Groq and Google STT clients"""
+        # Initialize Groq client (primary)
+        if self.groq_api_key and GROQ_SDK_AVAILABLE:
+            try:
+                self.groq_client = Groq(api_key=self.groq_api_key)
+                print("STT: Groq Whisper client initialized (primary)")
+            except Exception as e:
+                print(f"STT: Warning - Could not initialize Groq client: {e}")
+                self.groq_client = None
+        else:
+            if not self.groq_api_key:
+                print("STT: GROQ_API_KEY not set - Groq Whisper will not be available")
+            if not GROQ_SDK_AVAILABLE:
+                print("STT: Groq SDK not available - install with: pip install groq")
+            self.groq_client = None
+        
+        # Initialize Google STT client (fallback)
         try:
             # Try to use service account credentials if available
             creds_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
@@ -40,14 +69,15 @@ class STTService:
             
             if creds_path and os.path.exists(creds_path):
                 credentials = service_account.Credentials.from_service_account_file(creds_path)
-                self.client = speech.SpeechClient(credentials=credentials)
+                self.google_client = speech.SpeechClient(credentials=credentials)
             else:
                 # Use default credentials (for local development)
-                self.client = speech.SpeechClient()
-            print("STT: Google Speech-to-Text client initialized")
+                self.google_client = speech.SpeechClient()
+            print("STT: Google Speech-to-Text client initialized (fallback)")
         except Exception as e:
-            print(f"Warning: Could not initialize STT client: {e}")
-            print("STT will not be available. Make sure GOOGLE_APPLICATION_CREDENTIALS is set or service-account-key.json exists in config/ or root.")
+            print(f"STT: Warning - Could not initialize Google STT client: {e}")
+            print("STT: Google STT will not be available as fallback. Make sure GOOGLE_APPLICATION_CREDENTIALS is set or service-account-key.json exists in config/ or root.")
+            self.google_client = None
     
     def _detect_wav_sample_rate(self, audio_data: bytes) -> Optional[int]:
         """
@@ -83,10 +113,82 @@ class STTService:
             print(f"STT: Error detecting WAV sample rate: {e}")
             return None
     
-    def transcribe_audio(self, audio_data: bytes, language_code: str = "en-US", 
-                        sample_rate: int = 16000, audio_format: str = "webm") -> Optional[str]:
+    def _transcribe_with_groq(self, audio_data: bytes, language_code: str = "en-US") -> Optional[str]:
         """
-        Transcribe audio data to text
+        Transcribe audio using Groq Whisper models
+        
+        Args:
+            audio_data: Raw audio bytes
+            language_code: Language code (default: en-US)
+            
+        Returns:
+            Transcribed text or None if failed
+        """
+        if not self.groq_client:
+            return None
+        
+        try:
+            # Extract language code (e.g., "en-US" -> "en")
+            lang = language_code.split('-')[0] if '-' in language_code else language_code
+            
+            # Try preferred model first (turbo for speed)
+            models_to_try = [self.preferred_model, self.fallback_model]
+            
+            for model in models_to_try:
+                try:
+                    print(f"STT: Trying Groq Whisper model: {model} (language: {lang})")
+                    
+                    # Groq expects a file tuple: (filename, file_content)
+                    # Determine file extension based on audio format/size
+                    # For WebM/Opus, use m4a extension (Groq handles it)
+                    # For WAV, use wav extension
+                    file_extension = "m4a"  # Default for WebM/Opus
+                    if len(audio_data) > 44 and audio_data[0:4] == b'RIFF':
+                        file_extension = "wav"  # WAV file detected
+                    
+                    # Use Groq SDK for transcription
+                    # Groq expects: file=(filename, file_content_bytes)
+                    transcription = self.groq_client.audio.transcriptions.create(
+                        file=(f"audio.{file_extension}", audio_data),
+                        model=model,
+                        temperature=0,
+                        language=lang,
+                        response_format="verbose_json",
+                    )
+                    
+                    if hasattr(transcription, 'text') and transcription.text:
+                        text = transcription.text.strip()
+                        print(f"STT: Groq Whisper ({model}) transcription successful: '{text}'")
+                        return text
+                    else:
+                        print(f"STT: Groq Whisper ({model}) returned empty transcription")
+                        continue
+                        
+                except Exception as e:
+                    error_str = str(e).lower()
+                    # Check for rate limit errors
+                    if 'rate limit' in error_str or '429' in error_str or 'quota' in error_str:
+                        print(f"STT: Groq Whisper ({model}) rate limited: {e}")
+                        # Try next model, then fallback to Google
+                        continue
+                    else:
+                        print(f"STT: Groq Whisper ({model}) error: {e}")
+                        # Try next model
+                        continue
+            
+            print("STT: All Groq Whisper models failed, will try Google STT fallback")
+            return None
+            
+        except Exception as e:
+            print(f"STT: Groq Whisper transcription error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _transcribe_with_google(self, audio_data: bytes, language_code: str = "en-US", 
+                                sample_rate: int = 16000, audio_format: str = "webm") -> Optional[str]:
+        """
+        Transcribe audio using Google Speech-to-Text (fallback)
         
         Args:
             audio_data: Raw audio bytes
@@ -97,8 +199,7 @@ class STTService:
         Returns:
             Transcribed text or None if failed
         """
-        if not self.client:
-            print("STT: Client not initialized")
+        if not self.google_client:
             return None
         
         if not audio_data or len(audio_data) == 0:
@@ -106,7 +207,7 @@ class STTService:
             return None
         
         # Very small audio chunks are likely noise/silence
-        if len(audio_data) < 100:
+        if len(audio_data) < 500:
             print(f"STT: Audio too small ({len(audio_data)} bytes) - likely noise/silence")
             return None
         
@@ -178,16 +279,17 @@ class STTService:
                     audio = speech.RecognitionAudio(content=audio_data)
                     
                     # Perform transcription
-                    response = self.client.recognize(config=config, audio=audio)
+                    response = self.google_client.recognize(config=config, audio=audio)
                     
                     # Extract transcript
                     if response.results and len(response.results) > 0:
                         if response.results[0].alternatives and len(response.results[0].alternatives) > 0:
                             transcript = response.results[0].alternatives[0].transcript
-                            print(f"STT: Transcription successful with {strategy['name']}: {transcript}")
+                            confidence = response.results[0].alternatives[0].confidence if hasattr(response.results[0].alternatives[0], 'confidence') else None
+                            print(f"STT: Transcription successful with {strategy['name']}: '{transcript}' (confidence: {confidence})")
                             return transcript.strip()
                     
-                    print(f"STT: {strategy['name']} returned no results, trying next strategy...")
+                    print(f"STT: {strategy['name']} returned no results (response.results length: {len(response.results) if response.results else 0}), trying next strategy...")
                 except Exception as e:
                     error_str = str(e).lower()
                     if 'invalid argument' in error_str or 'unsupported' in error_str:
@@ -208,6 +310,111 @@ class STTService:
             traceback.print_exc()
             return None
     
+    def transcribe_audio(self, audio_data: bytes, language_code: str = "en-US",
+                        audio_format: str = "webm") -> Optional[str]:
+        """
+        Transcribe audio data (public method)
+        Uses parallel processing with both Google STT and Groq Whisper simultaneously
+        to get the fastest result and reduce error chance. Returns first successful result.
+        
+        Args:
+            audio_data: Raw audio bytes
+            language_code: Language code (default: en-US)
+            audio_format: Audio format - 'webm' or 'wav' (default: webm)
+            
+        Returns:
+            Transcribed text or None if failed
+        """
+        if not self.groq_client and not self.google_client:
+            print("STT: No STT clients initialized")
+            return None
+        
+        if not audio_data or len(audio_data) < 100:
+            print(f"STT: Audio data too small ({len(audio_data)} bytes)")
+            return None
+        
+        # Use parallel processing: call both STT services simultaneously
+        # This prevents duplicates by ensuring only one result is returned
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        
+        results = {}
+        errors = {}
+        lock = threading.Lock()
+        
+        def transcribe_google():
+            """Transcribe using Google STT"""
+            if not self.google_client:
+                return None
+            try:
+                # Detect sample rate for WAV files
+                sample_rate = 16000  # Default
+                if audio_format.lower() == 'wav':
+                    detected_rate = self._detect_wav_sample_rate(audio_data)
+                    if detected_rate:
+                        sample_rate = detected_rate
+                
+                result = self._transcribe_with_google(
+                    audio_data,
+                    language_code=language_code,
+                    sample_rate=sample_rate,
+                    audio_format=audio_format
+                )
+                if result and result.strip():
+                    with lock:
+                        results['google'] = result.strip()
+                    return result.strip()
+            except Exception as e:
+                with lock:
+                    errors['google'] = str(e)
+                return None
+        
+        def transcribe_groq():
+            """Transcribe using Groq Whisper"""
+            if not self.groq_client:
+                return None
+            try:
+                result = self._transcribe_with_groq(audio_data, language_code)
+                if result and result.strip():
+                    with lock:
+                        results['groq'] = result.strip()
+                    return result.strip()
+            except Exception as e:
+                with lock:
+                    errors['groq'] = str(e)
+                return None
+        
+        # Run both STT services in parallel
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {}
+            
+            if self.google_client:
+                futures['google'] = executor.submit(transcribe_google)
+            if self.groq_client:
+                futures['groq'] = executor.submit(transcribe_groq)
+            
+            # Wait for first successful result (prevents duplicates)
+            for future in as_completed(futures.values()):
+                provider = [k for k, v in futures.items() if v == future][0]
+                try:
+                    result = future.result()
+                    if result and result.strip():
+                        # Cancel other futures to prevent duplicate processing
+                        for other_provider, other_future in futures.items():
+                            if other_provider != provider:
+                                other_future.cancel()
+                        print(f"STT: {provider.capitalize()} transcription succeeded (parallel): '{result[:50]}...'")
+                        return result.strip()
+                except Exception as e:
+                    print(f"STT: {provider.capitalize()} transcription exception: {e}")
+        
+        # If we get here, both failed
+        if errors:
+            print(f"STT: All transcription methods failed. Errors: {errors}")
+        else:
+            print("STT: All transcription methods returned empty/None")
+        return None
+    
     def transcribe_chunks(self, audio_chunks: List[bytes], language_code: str = "en-US",
                          audio_format: str = "webm") -> Optional[str]:
         """
@@ -221,8 +428,8 @@ class STTService:
         Returns:
             Merged transcribed text or None if failed
         """
-        if not self.client:
-            print("STT: Client not initialized")
+        if not self.groq_client and not self.google_client:
+            print("STT: No STT clients initialized")
             return None
         
         if not audio_chunks or len(audio_chunks) == 0:

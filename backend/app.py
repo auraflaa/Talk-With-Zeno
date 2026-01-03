@@ -8,7 +8,12 @@ from flask_cors import CORS
 import os
 import io
 import uuid
+import time
 from datetime import datetime
+
+# Initialize logger
+from backend.services.logger_service import get_logger
+logger = get_logger()
 
 app = Flask(__name__)
 
@@ -37,11 +42,13 @@ def get_services():
     from backend.services.llm_service import get_llm_service
     from backend.services.tts_service import get_tts_service
     from backend.services.storage_service import get_storage_service
+    from backend.services.metrics_service import get_metrics_service
     return {
         'stt': get_stt_service(),
         'llm': get_llm_service(),
         'tts': get_tts_service(),
-        'storage': get_storage_service()
+        'storage': get_storage_service(),
+        'metrics': get_metrics_service()
     }
 
 # Cache services after first load
@@ -59,7 +66,10 @@ def services():
 def health_check():
     """Health check endpoint"""
     svcs = services()
-    stt_available = svcs['stt'].client is not None if svcs['stt'] else False
+    # Check if STT service has either Groq or Google client available
+    stt_available = False
+    if svcs['stt']:
+        stt_available = (svcs['stt'].groq_client is not None) or (svcs['stt'].google_client is not None)
     llm_available = svcs['llm'].model is not None if svcs['llm'] else False
     tts_available = len(svcs['tts'].providers) > 0 if svcs['tts'] else False
     
@@ -150,10 +160,10 @@ def process_voice():
         svcs = services()
         
         # Step 1: STT - Convert speech to text using chunk-wise processing
-        if not svcs['stt'].client:
+        if not svcs['stt'].groq_client and not svcs['stt'].google_client:
             print("ERROR: STT client not initialized")
             return jsonify({
-                "error": "Speech-to-Text service not available. Please check GOOGLE_APPLICATION_CREDENTIALS in .env.local"
+                "error": "Speech-to-Text service not available. Please check GROQ_API_KEY (primary) or GOOGLE_APPLICATION_CREDENTIALS (fallback) in .env.local"
             }), 500
         
         print(f"STT: Starting chunk-wise transcription (format: {audio_format}, size: {len(audio_data)} bytes)")
@@ -461,15 +471,103 @@ def process_stream_chunk():
         # Get services
         svcs = services()
         
-        if not svcs['stt'].client:
+        if not svcs['stt'].groq_client and not svcs['stt'].google_client:
             return jsonify({"error": "STT service not available"}), 500
         
-        # Process this chunk with STT
-        chunk_text = svcs['stt'].transcribe_audio(
-            audio_data,
-            language_code=language_code,
-            audio_format=audio_format
-        )
+        # NOTE: Backend VAD (silero-vad/webrtcvad) requires PCM audio, not WebM/Opus
+        # We cannot use backend VAD on WebM chunks directly - it will incorrectly reject all audio
+        # Instead, let STT process the audio and use STT results to determine if it's noise
+        # Frontend VAD is sufficient for initial filtering
+        # Backend VAD can be used later if we convert WebM to PCM (requires additional processing)
+        use_backend_vad = False  # Disabled for WebM - VAD requires PCM audio
+        
+        # Add chunk to session for accumulation (only if valid size)
+        # Empty or very small chunks create invalid WebM files
+        if audio_data and len(audio_data) >= 100:
+            session.add_chunk(audio_data)
+        else:
+            # Empty or very small chunk - treat as noise, don't accumulate
+            print(f"Streaming: Skipping empty/small chunk ({len(audio_data) if audio_data else 0} bytes)")
+            merged_text = session.get_merged_text() if session.text_chunks else ""
+            return jsonify({
+                "chunk_text": "",
+                "is_noise": True,
+                "should_process": bool(merged_text and len(merged_text.strip()) >= 2),
+                "merged_text": merged_text,
+                "session_id": session_id,
+                "conversation_id": session.conversation_id
+            })
+        
+        # Accumulate chunks before processing - WebM needs larger segments for valid files
+        # 30KB ≈ 3-4 seconds of audio at typical WebM/Opus bitrates (~64kbps)
+        # Process more frequently to prevent chunks from growing too large and becoming invalid
+        total_accumulated = sum(len(chunk) for chunk in session.audio_chunks)
+        MIN_CHUNK_SIZE_FOR_STT = 30000  # 30KB minimum for 3-4 seconds of audio (faster processing)
+        MAX_CHUNK_SIZE_FOR_STT = 300000  # 300KB maximum (≈20 seconds) - prevent Google STT "too long" errors and invalid WebM
+        
+        chunk_text = None
+        
+        # Process if:
+        # 1. We have enough accumulated audio (40KB)
+        # 2. Chunk is getting too large (1MB) - force processing to prevent errors
+        # 3. This is the final chunk
+        should_process = total_accumulated >= MIN_CHUNK_SIZE_FOR_STT or total_accumulated >= MAX_CHUNK_SIZE_FOR_STT or is_final
+        
+        if should_process:
+            # Merge all accumulated chunks into one audio segment
+            accumulated_audio = b''.join(session.audio_chunks)
+            print(f"Streaming: Processing accumulated audio (chunks: {len(session.audio_chunks)}, total size: {len(accumulated_audio)} bytes, format: {audio_format})")
+            
+            try:
+                print(f"Streaming: Calling STT with {len(accumulated_audio)} bytes of {audio_format} audio")
+                
+                # If chunk is too large, split it into smaller segments
+                if len(accumulated_audio) > MAX_CHUNK_SIZE_FOR_STT:
+                    print(f"Streaming: WARNING - Chunk too large ({len(accumulated_audio)} bytes), splitting into segments")
+                    # Split into 500KB segments (≈30 seconds each)
+                    segment_size = 500000
+                    segments = [accumulated_audio[i:i+segment_size] for i in range(0, len(accumulated_audio), segment_size)]
+                    print(f"Streaming: Split into {len(segments)} segments")
+                    
+                    # Process first segment only (most recent audio)
+                    chunk_text = svcs['stt'].transcribe_audio(
+                        segments[-1],  # Use last segment (most recent)
+                        language_code=language_code,
+                        audio_format=audio_format
+                    )
+                else:
+                    chunk_text = svcs['stt'].transcribe_audio(
+                        accumulated_audio,
+                        language_code=language_code,
+                        audio_format=audio_format
+                    )
+                
+                if chunk_text and chunk_text.strip():
+                    chunk_text = chunk_text.strip()
+                    print(f"Streaming: STT transcribed successfully: '{chunk_text}' (length: {len(chunk_text)} chars)")
+                    # Add transcribed text to session (will prevent duplicates)
+                    session.add_text_chunk(chunk_text)
+                else:
+                    print(f"Streaming: STT returned empty/None (likely noise/silence or STT error)")
+                    print(f"Streaming: Check STT service logs above for details")
+                    chunk_text = None
+                
+                # CRITICAL: Clear accumulated chunks after processing to prevent memory buildup and invalid WebM files
+                chunks_cleared = len(session.audio_chunks)
+                session.audio_chunks.clear()
+                print(f"Streaming: Cleared {chunks_cleared} accumulated audio chunks after processing")
+            except Exception as e:
+                print(f"Streaming: STT error: {e}")
+                import traceback
+                traceback.print_exc()
+                chunk_text = None
+                # Clear chunks even on error to prevent accumulation
+                session.audio_chunks.clear()
+                print(f"Streaming: Cleared accumulated chunks after error")
+        else:
+            # Not enough audio yet, wait for more chunks
+            if total_accumulated > 0:
+                print(f"Streaming: Accumulating audio (current: {total_accumulated} bytes, need: {MIN_CHUNK_SIZE_FOR_STT} bytes, max: {MAX_CHUNK_SIZE_FOR_STT} bytes)")
         
         # Check if chunk is noise (empty or very short)
         is_noise = False
@@ -479,18 +577,24 @@ def process_stream_chunk():
         if not chunk_text or len(chunk_text.strip()) < 2:
             # This chunk is noise
             is_noise = True
-            print(f"Streaming: Chunk {len(session.audio_chunks)} is noise (no text detected)")
+            print(f"Streaming: Accumulated audio is noise (no text detected, {len(session.audio_chunks)} chunks)")
             
             # If we have previous text chunks, merge and trigger processing
             merged_text = session.get_merged_text()
             if merged_text and len(merged_text.strip()) >= 2:
                 should_process = True
-                print(f"Streaming: Noise detected, merging {len(session.text_chunks)} chunks: '{merged_text}'")
+                print(f"Streaming: Noise detected, merging {len(session.text_chunks)} text chunks: '{merged_text}'")
+            
+            # Clear accumulated audio chunks if we processed them (to prevent memory buildup)
+            if total_accumulated >= MIN_CHUNK_SIZE_FOR_STT or is_final:
+                session.audio_chunks = []  # Clear processed chunks
         else:
-            # Chunk has text - add it
+            # Chunk has text - it was already added to session in the try block above
             chunk_text = chunk_text.strip()
-            session.add_text_chunk(chunk_text)
-            print(f"Streaming: Chunk {len(session.audio_chunks)} transcribed: '{chunk_text}'")
+            print(f"Streaming: Accumulated audio transcribed: '{chunk_text}' (already added to session)")
+            
+            # Clear accumulated audio chunks after successful transcription
+            session.audio_chunks = []  # Clear processed chunks
         
         # Force processing if is_final flag is set
         if is_final:
@@ -498,6 +602,8 @@ def process_stream_chunk():
             if merged_text and len(merged_text.strip()) >= 2:
                 should_process = True
                 print(f"Streaming: Final chunk, processing merged text: '{merged_text}'")
+            # Clear all accumulated chunks on final
+            session.audio_chunks = []
         
         return jsonify({
             "chunk_text": chunk_text or "",
@@ -760,6 +866,12 @@ def process_text():
                 traceback.print_exc()
                 audio_response = None
         
+        # Ensure audio_base64 is always included if generate_audio was requested
+        if generate_audio and not audio_response:
+            print("TTS: WARNING - generate_audio=True but no audio was generated")
+            print("   This may cause the greeting/error message to not play audio")
+            print("   Check TTS service logs above for errors")
+        
         response_data = {
             "text_response": assistant_response,
             "conversation_id": conversation_id,
@@ -954,6 +1066,87 @@ def google_auth_callback():
         print(f"Error in Google auth callback: {e}")
         import traceback
         traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# ==================== Metrics API Endpoints ====================
+
+@app.route('/api/metrics/summary', methods=['GET'])
+def get_metrics_summary():
+    """Get metrics summary for dashboard"""
+    try:
+        hours = int(request.args.get('hours', 24))
+        svcs = services()
+        metrics_service = svcs.get('metrics')
+        
+        if not metrics_service:
+            return jsonify({"error": "Metrics service not available"}), 500
+        
+        summary = metrics_service.get_metrics_summary(hours=hours)
+        return jsonify(summary), 200
+    except Exception as e:
+        print(f"Error getting metrics summary: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/metrics/timeseries', methods=['GET'])
+def get_metrics_timeseries():
+    """Get time series data for a specific metric type"""
+    try:
+        metric_type = request.args.get('type', 'pipeline_calls')  # stt_calls, llm_calls, tts_calls, pipeline_calls
+        hours = int(request.args.get('hours', 24))
+        group_by = request.args.get('group_by', 'minute')  # minute, hour, second
+        
+        svcs = services()
+        metrics_service = svcs.get('metrics')
+        
+        if not metrics_service:
+            return jsonify({"error": "Metrics service not available"}), 500
+        
+        timeseries = metrics_service.get_time_series(
+            metric_type=metric_type,
+            hours=hours,
+            group_by=group_by
+        )
+        
+        return jsonify({
+            'metric_type': metric_type,
+            'hours': hours,
+            'group_by': group_by,
+            'data': timeseries
+        }), 200
+    except Exception as e:
+        print(f"Error getting time series: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/metrics/models', methods=['GET'])
+def get_model_stats():
+    """Get statistics per model"""
+    try:
+        hours = int(request.args.get('hours', 24))
+        svcs = services()
+        metrics_service = svcs.get('metrics')
+        
+        if not metrics_service:
+            return jsonify({"error": "Metrics service not available"}), 500
+        
+        summary = metrics_service.get_metrics_summary(hours=hours)
+        
+        # Extract model-specific stats
+        models = {
+            'stt_models': summary.get('stt', {}).get('by_model', {}),
+            'llm_models': summary.get('llm', {}).get('by_model', {}),
+            'tts_providers': summary.get('tts', {}).get('by_provider', {})
+        }
+        
+        return jsonify(models), 200
+    except Exception as e:
+        print(f"Error getting model stats: {e}")
         return jsonify({"error": str(e)}), 500
 
 

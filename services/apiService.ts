@@ -297,7 +297,7 @@ class ApiService {
         if (!controller.signal.aborted) {
           controller.abort();
         }
-      }, 20000); // 20 second timeout per chunk (STT can take time)
+      }, 60000); // Increased to 60 seconds for STT processing (larger chunks take longer)
 
       let response: Response;
       try {

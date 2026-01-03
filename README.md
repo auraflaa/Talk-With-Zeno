@@ -247,7 +247,7 @@ Talk-With-Zeno/
 │   │   ├── streaming_service.py
 │   │   └── cache_service.py
 │   ├── tests/             # Test suite
-│   │   ├── test_all_services.py
+│   │   ├── test_services.py
 │   │   ├── test_pipeline.py
 │   │   └── deep_analysis.py
 │   ├── app.py             # Main API endpoints
@@ -305,7 +305,7 @@ Talk-With-Zeno/
 
 1. **Check API keys:**
    ```bash
-   python backend/tests/test_all_services.py
+   python backend/tests/test_services.py
    ```
 
 2. **Common issues:**
@@ -376,8 +376,6 @@ This makes the system:
 - **Multilingual support** for voice and text
 - **Production-ready storage** (database migration)
 - **Advanced personalization** with fine-tuned models
-- **Mobile app** for iOS and Android
-- **Offline mode** for privacy-conscious users
 
 ---
 
@@ -390,10 +388,10 @@ The system includes comprehensive performance analysis tools:
 python backend/tests/deep_analysis.py
 
 # Test individual services
-python backend/tests/test_all_services.py
+python backend/tests/test_services.py
 
-# Test pipeline integration
-python backend/tests/test_pipeline_integration.py
+# Test pipeline
+python backend/tests/test_pipeline.py
 ```
 
 Results are saved to `performance_results/DEEP_ANALYSIS.md` with:

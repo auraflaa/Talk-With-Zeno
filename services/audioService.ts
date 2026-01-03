@@ -18,10 +18,15 @@ export class AudioService {
   private vadInterval: number | null = null;
   private isVADActive: boolean = false;
   
-  // VAD thresholds
-  private readonly VAD_THRESHOLD = 30; // Volume threshold (0-255)
-  private readonly SILENCE_DURATION = 1500; // ms of silence before auto-stop
-  private readonly MIN_SPEECH_DURATION = 500; // ms minimum speech to process
+  // VAD thresholds - optimized for faster response and better accuracy
+  // These work in conjunction with backend VAD (silero-vad) for highest accuracy
+  private readonly VAD_THRESHOLD = 25; // Volume threshold (0-255) - lowered for better sensitivity
+  private readonly SILENCE_DURATION = 400; // ms of silence before auto-stop (optimized for faster response)
+  private readonly MIN_SPEECH_DURATION = 150; // ms minimum speech to process (optimized for faster response)
+  
+  // Advanced VAD parameters for better accuracy
+  private readonly RMS_THRESHOLD = 12; // RMS threshold for time domain (lowered for better sensitivity)
+  private readonly FREQUENCY_THRESHOLD = 20; // Frequency domain threshold
   
   // Speech detection state
   private lastSpeechTime: number = 0;
@@ -228,7 +233,7 @@ export class AudioService {
           this.cleanup();
           reject(new Error('Recording stop timeout - no audio data'));
         }
-      }, 3000); // Reduced timeout to 3 seconds
+      }, 500); // Reduced timeout to 500ms for faster response
 
       // Store reference to current recorder to avoid race conditions
       const recorder = this.mediaRecorder;
@@ -378,7 +383,8 @@ export class AudioService {
 
   async playAudio(audioBlob: Blob): Promise<void> {
     return new Promise((resolve, reject) => {
-      // Stop any currently playing audio
+      // Only stop currently playing audio if it's not the greeting (allow greeting to play)
+      // For now, always stop previous audio to prevent overlap
       this.stopAudio();
       
       const audio = new Audio();
@@ -412,8 +418,13 @@ export class AudioService {
       audio.oncanplaythrough = () => {
         console.log('Audio ready to play');
       };
+      
+      // Set volume to ensure audio is audible
+      audio.volume = 1.0;
 
       audio.src = url;
+      // Load the audio first to ensure it's ready
+      audio.load();
       const playPromise = audio.play();
       
       if (playPromise !== undefined) {
@@ -422,9 +433,16 @@ export class AudioService {
             console.log('Audio play() succeeded');
           })
           .catch((error) => {
-            console.error('Audio play() failed:', error);
-            cleanup();
-            reject(error);
+            // Ignore AbortError - it's expected if audio is interrupted
+            if (error.name === 'AbortError') {
+              console.log('Audio play() interrupted (expected)');
+              cleanup();
+              resolve(); // Resolve instead of reject for AbortError
+            } else {
+              console.error('Audio play() failed:', error);
+              cleanup();
+              reject(error);
+            }
           });
       } else {
         // Fallback for browsers that don't return promise
@@ -442,7 +460,10 @@ export class AudioService {
     if (this.currentAudio) {
       try {
         console.log('Stopping current audio playback');
-        this.currentAudio.pause();
+        // Don't pause if already paused/ended to avoid AbortError
+        if (!this.currentAudio.paused) {
+          this.currentAudio.pause();
+        }
         this.currentAudio.currentTime = 0;
         // Remove event listeners to prevent memory leaks
         this.currentAudio.onended = null;
@@ -473,7 +494,12 @@ export class AudioService {
   }
 
   isPlaying(): boolean {
-    return this.currentAudio !== null && !this.currentAudio.paused && !this.currentAudio.ended;
+    if (!this.currentAudio) return false;
+    // Check if audio is actually playing (not paused, not ended, and has started)
+    return !this.currentAudio.paused && 
+           !this.currentAudio.ended && 
+           this.currentAudio.currentTime > 0 &&
+           this.currentAudio.readyState >= 2; // HAVE_CURRENT_DATA or higher
   }
 
   isRecording(): boolean {
@@ -526,27 +552,53 @@ export class AudioService {
     const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
     this.analyser.getByteFrequencyData(dataArray);
     
-    // Calculate average volume (simple energy-based VAD)
+    // Enhanced VAD calculation - improved accuracy
+    // Frequency domain analysis
     let sum = 0;
+    let maxFreq = 0;
     for (let i = 0; i < dataArray.length; i++) {
       sum += dataArray[i];
+      if (dataArray[i] > maxFreq) {
+        maxFreq = dataArray[i];
+      }
     }
     const averageVolume = sum / dataArray.length;
     
-    // Also check time domain for better detection
+    // Time domain analysis (RMS)
     const timeData = new Uint8Array(this.analyser.fftSize);
     this.analyser.getByteTimeDomainData(timeData);
     
     // Calculate RMS (Root Mean Square) for time domain
     let rms = 0;
+    let zeroCrossings = 0;
     for (let i = 0; i < timeData.length; i++) {
       const normalized = (timeData[i] - 128) / 128;
       rms += normalized * normalized;
+      
+      // Count zero crossings (speech has more zero crossings than noise)
+      if (i > 0) {
+        const prevNormalized = (timeData[i - 1] - 128) / 128;
+        if ((normalized >= 0 && prevNormalized < 0) || (normalized < 0 && prevNormalized >= 0)) {
+          zeroCrossings++;
+        }
+      }
     }
     rms = Math.sqrt(rms / timeData.length) * 100;
     
-    // Combined threshold check (frequency + time domain)
-    const isSpeaking = averageVolume > this.VAD_THRESHOLD || rms > 15;
+    // Zero crossing rate (speech typically has higher ZCR than noise)
+    const zcr = (zeroCrossings / timeData.length) * 100;
+    
+    // Enhanced combined threshold check:
+    // 1. Frequency domain: average volume OR peak frequency
+    // 2. Time domain: RMS energy
+    // 3. Zero crossing rate (speech indicator)
+    const freqCheck = averageVolume > this.VAD_THRESHOLD || maxFreq > this.FREQUENCY_THRESHOLD;
+    const timeCheck = rms > this.RMS_THRESHOLD;
+    const zcrCheck = zcr > 5 && zcr < 50; // Speech has moderate ZCR, noise has very low or very high
+    
+    // Combined decision: at least 2 out of 3 indicators must be positive
+    const indicators = [freqCheck, timeCheck, zcrCheck].filter(Boolean).length;
+    const isSpeaking = indicators >= 2;
     const audioLevel = Math.min(100, (averageVolume / 255) * 100);
     
     const now = Date.now();
@@ -596,9 +648,11 @@ export class AudioService {
       this.vadCallback(isSpeaking, audioLevel);
     }
     
-    // Continue monitoring
+    // Continue monitoring with adaptive interval
+    // Faster checking when speech is detected for more responsive detection
     if (this.isVADActive) {
-      this.vadInterval = window.setTimeout(() => this.monitorVAD(), 100); // Check every 100ms
+      const interval = isSpeaking ? 50 : 100; // Check every 50ms during speech, 100ms during silence
+      this.vadInterval = window.setTimeout(() => this.monitorVAD(), interval);
     }
   }
 

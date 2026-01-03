@@ -63,10 +63,11 @@ Get user personalization data
 ## Services
 
 ### STT Service (`services/stt_service.py`)
-- Google Cloud Speech-to-Text
-- Model: `phone_call` (optimized for voice conversations)
-- Converts audio (WebM/WAV) to text with chunk-wise processing
-- Requires: `GOOGLE_APPLICATION_CREDENTIALS`
+- Groq Whisper (primary): `whisper-large-v3-turbo` (fast) or `whisper-large-v3` (accurate)
+- Google Cloud Speech-to-Text (fallback): `phone_call` model
+- Converts audio (WebM/WAV/M4A) to text with chunk-wise processing
+- Automatic fallback on rate limits or errors
+- Requires: `GROQ_API_KEY` (primary) or `GOOGLE_APPLICATION_CREDENTIALS` (fallback)
 
 ### LLM Service (`services/llm_service.py`)
 - Google Gemini models with fallback
@@ -95,30 +96,36 @@ python scripts/init_db.py
 
 ## Testing
 
-Test all services:
+Test services and pipeline:
 ```bash
-# Comprehensive service test (includes Database, Storage, API)
-python backend/tests/test_all_services.py
+# Comprehensive service test (STT, LLM, TTS, Storage, Database, API)
+python backend/tests/test_services.py
 
 # End-to-end pipeline test (text, voice, storage, audio files)
 python backend/tests/test_pipeline.py
 
-# Streaming pipeline test (chunk-wise processing)
-python backend/tests/test_streaming_pipeline.py
-
-# Deep production-grade analysis (includes STT chunk size analysis)
+# Deep production-grade analysis (STT, LLM, TTS, chunk sizes, full pipeline)
 python backend/tests/deep_analysis.py
-
-# Pipeline integration test
-python backend/tests/test_pipeline_integration.py
 ```
+
+## Voice Activity Detection (VAD)
+
+The backend includes a VAD service (`services/vad_service.py`) that can detect speech vs noise. Currently, the frontend uses Web Audio API for VAD, but the backend service is available for future use.
+
+**Available Libraries:**
+- **silero-vad**: ML-based, highest accuracy (recommended)
+- **webrtcvad**: Fast, lightweight fallback
+- **Simple energy detection**: Basic fallback if libraries unavailable
+
+**Note:** VAD is currently implemented in the frontend (`services/audioService.ts`) using Web Audio API for real-time processing.
 
 ## Environment Variables
 
 Required in `.env.local`:
 - `GEMINI_API_KEY` - For LLM
 - `GROQ_API_KEY` - For TTS (primary)
-- `GOOGLE_APPLICATION_CREDENTIALS` - For STT (path to service account JSON)
+- `GROQ_API_KEY` - For STT (primary) and TTS (primary) - same key for both
+- `GOOGLE_APPLICATION_CREDENTIALS` - For STT fallback (path to service account JSON)
 - `DATABASE_PATH` - SQLite path (default: `./data/zeno.db`)
 
 ### Google OAuth (Optional)
