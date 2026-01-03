@@ -238,7 +238,13 @@ class StorageService:
             "preferences": {
                 "tone": "supportive",
                 "depth": "moderate",
-                "communication_style": "conversational"
+                "communication_style": {
+                    "formality": "casual",
+                    "message_length": "short",
+                    "punctuation_style": "minimal",
+                    "language_style": "conversational",
+                    "examples": []
+                }
             },
             "emotional_patterns": [],
             "topics_of_interest": [],

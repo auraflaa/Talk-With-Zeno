@@ -83,8 +83,8 @@ class TTSService:
                 tts_model = model or "canopylabs/orpheus-v1-english"
                 
                 # Available voices: autumn, diana, hannah, austin, daniel, troy
-                # Default to autumn for natural conversational tone
-                voice_id = voice or "autumn"
+                # Default to troy as requested
+                voice_id = voice or "troy"
                 
                 # Truncate text to 200 characters (Groq limit)
                 if len(text) > 200:
@@ -127,7 +127,8 @@ class TTSService:
             tts_model = model or "canopylabs/orpheus-v1-english"
             
             # Available voices: autumn, diana, hannah, austin, daniel, troy
-            voice_id = voice or "autumn"
+            # Default to troy as requested
+            voice_id = voice or "troy"
             
             # Truncate text to 200 characters (Groq limit)
             if len(text) > 200:

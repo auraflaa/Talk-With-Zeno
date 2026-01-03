@@ -159,14 +159,49 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, onLogout, the
 
     const handleUserSendMessage = (text: string) => {
         // Add user message to UI immediately
-        updateActiveSessionMessages({
-            id: Date.now().toString(),
-            role: 'user',
-            content: text,
-            timestamp: new Date()
-        });
-        // Note: The actual backend API call is handled by LiveInterface's handleTextSubmit
-        // This function just updates the UI state
+        // If the message is a placeholder like "[Transcribing...]", replace the last user message if it's also a placeholder
+        if (!activeSessionId) return;
+        
+        setSessions(prev => prev.map(session => {
+            if (session.id === activeSessionId) {
+                const messages = [...session.messages];
+                const lastMessage = messages[messages.length - 1];
+                
+                // If last message is a placeholder and new message is also a placeholder or actual text, replace it
+                if (lastMessage && 
+                    lastMessage.role === 'user' && 
+                    (lastMessage.content.startsWith('[') || text.startsWith('['))) {
+                    // Replace the last message
+                    messages[messages.length - 1] = {
+                        id: lastMessage.id, // Keep same ID
+                        role: 'user',
+                        content: text,
+                        timestamp: new Date()
+                    };
+                } else {
+                    // Add new message
+                    messages.push({
+                        id: Date.now().toString(),
+                        role: 'user',
+                        content: text,
+                        timestamp: new Date()
+                    });
+                }
+                
+                let title = session.title;
+                // Auto-title logic
+                if ((title === 'New Conversation' || title === 'New Chat') && !text.startsWith('[')) {
+                    title = text.slice(0, 24) + (text.length > 24 ? '...' : '');
+                }
+                
+                return {
+                    ...session,
+                    title,
+                    messages
+                };
+            }
+            return session;
+        }));
     };
 
     const handleEndSession = () => {
@@ -236,6 +271,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, onLogout, the
                                             timestamp: new Date()
                                         })}
                                         userId={currentUser.id}
+                                        userName={currentUser.name}
                                         conversationId={activeSession.id}
                                     />
                                 )}

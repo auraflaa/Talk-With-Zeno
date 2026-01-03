@@ -99,6 +99,7 @@ def process_voice():
         if not user_id:
             return jsonify({"error": "user_id is required"}), 400
         
+        user_name = request.form.get('user_name')  # Optional user name
         conversation_id = request.form.get('conversation_id') or str(uuid.uuid4())
         language_code = request.form.get('language_code', 'en-US')
         
@@ -109,9 +110,15 @@ def process_voice():
         audio_file = request.files['audio']
         audio_data = audio_file.read()
         
-        # Check audio size
-        if len(audio_data) < 100:
-            return jsonify({"error": "Audio file too short. Please record for at least 1 second."}), 400
+        # Check audio size and validate
+        if len(audio_data) < 500:
+            return jsonify({"error": "Audio file too short. Please record for at least 1 second and speak clearly."}), 400
+        
+        # Validate audio data integrity
+        if len(audio_data) > 10 * 1024 * 1024:  # 10MB limit
+            return jsonify({"error": "Audio file too large (max 10MB). Please record a shorter message."}), 400
+        
+        print(f"Audio validation: size={len(audio_data)} bytes, format={audio_format}, valid=True")
         
         # Detect audio format from filename or content type
         filename = audio_file.filename or 'audio.webm'
@@ -126,30 +133,82 @@ def process_voice():
         # Get services
         svcs = services()
         
-        # Step 1: STT - Convert speech to text
+        # Step 1: STT - Convert speech to text using chunk-wise processing
         if not svcs['stt'].client:
             print("ERROR: STT client not initialized")
             return jsonify({
                 "error": "Speech-to-Text service not available. Please check GOOGLE_APPLICATION_CREDENTIALS in .env.local"
             }), 500
         
-        print(f"STT: Starting transcription (format: {audio_format}, size: {len(audio_data)} bytes)")
-        user_text = svcs['stt'].transcribe_audio(
-            audio_data,
-            language_code=language_code,
-            audio_format=audio_format
-        )
+        print(f"STT: Starting chunk-wise transcription (format: {audio_format}, size: {len(audio_data)} bytes)")
+        print(f"STT: Language code: {language_code}")
+        
+        # Split audio into chunks for better transcription accuracy
+        # Each chunk should be 2-3 seconds of audio
+        # For WebM/Opus at ~48kbps, 2 seconds ≈ 12KB, 3 seconds ≈ 18KB
+        chunk_size_bytes = 15000  # ~2.5 seconds of audio
+        audio_chunks = []
+        
+        if len(audio_data) > chunk_size_bytes:
+            # Split into chunks
+            for i in range(0, len(audio_data), chunk_size_bytes):
+                chunk = audio_data[i:i + chunk_size_bytes]
+                if len(chunk) >= 500:  # Only include chunks with minimum size
+                    audio_chunks.append(chunk)
+            print(f"STT: Split audio into {len(audio_chunks)} chunks for processing")
+        else:
+            # Audio is short enough, process as single chunk
+            audio_chunks = [audio_data]
+            print(f"STT: Audio is short, processing as single chunk")
+        
+        # Process chunks and merge
+        user_text = None
+        if len(audio_chunks) > 1:
+            # Use chunk-wise processing
+            user_text = svcs['stt'].transcribe_chunks(
+                audio_chunks,
+                language_code=language_code,
+                audio_format=audio_format
+            )
+        else:
+            # Single chunk - use regular transcription
+            user_text = svcs['stt'].transcribe_audio(
+                audio_data,
+                language_code=language_code,
+                audio_format=audio_format
+            )
         
         if not user_text:
             print("ERROR: STT failed - no transcription returned")
             print(f"  Audio size: {len(audio_data)} bytes")
             print(f"  Audio format: {audio_format}")
             print(f"  Language code: {language_code}")
+            print(f"  Number of chunks processed: {len(audio_chunks)}")
             return jsonify({
                 "error": "Could not transcribe audio. Possible reasons: 1) Audio too short or silent, 2) STT service error, 3) Check backend logs for details"
             }), 400
         
+        # Clean and validate transcription
+        user_text = user_text.strip()
+        
+        # Check for very short or meaningless transcriptions (likely noise or silence)
+        if len(user_text) < 2:
+            print(f"ERROR: Transcription too short ({len(user_text)} chars): '{user_text}' - likely silence or noise")
+            return jsonify({
+                "error": "No speech detected. Please speak clearly."
+            }), 400
+        
+        # Check for common noise patterns that STT might transcribe
+        noise_patterns = ['hmm', 'uh', 'um', 'ah', 'eh', 'oh']
+        if user_text.lower() in noise_patterns and len(user_text) <= 3:
+            print(f"ERROR: Transcription appears to be noise: '{user_text}'")
+            return jsonify({
+                "error": "No clear speech detected. Please speak a complete sentence."
+            }), 400
+        
         print(f"STT: Successfully transcribed: '{user_text}'")
+        print(f"STT: Transcription length: {len(user_text)} characters")
+        print(f"STT: Transcription will be sent to LLM as user message")
         
         # Step 2: Load conversation history
         conversation = svcs['storage'].load_conversation(user_id, conversation_id)
@@ -164,15 +223,26 @@ def process_voice():
         conversation_history.append(user_message)
         
         # Step 3: LLM - Generate response with personalization
-        print(f"Processing voice input for user {user_id}, conversation {conversation_id}")
-        print(f"Transcribed text: {user_text}")
-        print(f"Conversation history length: {len(conversation_history)}")
+        print(f"LLM: Processing voice input for user {user_id}, conversation {conversation_id}")
+        print(f"LLM: Transcribed user text: '{user_text}'")
+        print(f"LLM: Transcribed text length: {len(user_text)} characters")
+        print(f"LLM: Conversation history length: {len(conversation_history)} messages")
+        
+        # Verify the transcribed text is being passed correctly
+        if not user_text or len(user_text.strip()) == 0:
+            print("ERROR: Transcribed text is empty - cannot generate LLM response")
+            return jsonify({
+                "error": "Transcribed text is empty. Please speak clearly and try again."
+            }), 400
         
         llm_result = svcs['llm'].generate_response(
             user_id=user_id,
             user_message=user_text,
-            conversation_history=conversation_history
+            conversation_history=conversation_history,
+            user_name=user_name
         )
+        
+        print(f"LLM: Generated response length: {len(llm_result.get('response', ''))} characters")
         
         assistant_response = llm_result["response"]
         updates_applied = llm_result.get("updates_applied", [])
@@ -308,6 +378,7 @@ def process_text():
         if not user_id:
             return jsonify({"error": "user_id is required"}), 400
         
+        user_name = data.get('user_name')  # Optional user name
         user_text = data.get('text')
         if not user_text:
             return jsonify({"error": "text is required"}), 400
@@ -338,11 +409,15 @@ def process_text():
         llm_result = svcs['llm'].generate_response(
             user_id=user_id,
             user_message=user_text,
-            conversation_history=conversation_history
+            conversation_history=conversation_history,
+            user_name=user_name
         )
         
         assistant_response = llm_result["response"]
         updates_applied = llm_result.get("updates_applied", [])
+        
+        print(f"LLM: Final response length: {len(assistant_response)} characters")
+        print(f"LLM: Final response (full): {assistant_response}")
         
         if updates_applied:
             print(f"Applied {len(updates_applied)} personalization updates")

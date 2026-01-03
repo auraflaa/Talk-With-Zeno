@@ -1,12 +1,16 @@
 """
 Google Speech-to-Text Service
 Converts audio/voice input to text
+Supports chunk-wise processing for better accuracy
 """
 
 import os
+import io
 from google.cloud import speech
 from google.oauth2 import service_account
-from typing import Optional, BinaryIO
+from typing import Optional, BinaryIO, List
+import wave
+import struct
 
 
 class STTService:
@@ -129,6 +133,8 @@ class STTService:
                     else:
                         # For other errors, log and try next
                         print(f"STT: Error with {strategy['name']}: {e}")
+                        import traceback
+                        traceback.print_exc()
                         continue
             
             print("STT: All encoding strategies failed - no transcription results")
@@ -138,6 +144,112 @@ class STTService:
             import traceback
             traceback.print_exc()
             return None
+    
+    def transcribe_chunks(self, audio_chunks: List[bytes], language_code: str = "en-US",
+                         audio_format: str = "webm") -> Optional[str]:
+        """
+        Transcribe audio by processing chunks and merging at sentence boundaries
+        
+        Args:
+            audio_chunks: List of audio chunk bytes (each chunk should be 2-3 seconds)
+            language_code: Language code
+            audio_format: Audio format
+            
+        Returns:
+            Merged transcribed text or None if failed
+        """
+        if not self.client:
+            print("STT: Client not initialized")
+            return None
+        
+        if not audio_chunks or len(audio_chunks) == 0:
+            print("STT: No audio chunks provided")
+            return None
+        
+        print(f"STT: Processing {len(audio_chunks)} audio chunks for chunk-wise transcription")
+        
+        all_transcripts = []
+        
+        # Process each chunk
+        successful_chunks = 0
+        for i, chunk_data in enumerate(audio_chunks):
+            if not chunk_data or len(chunk_data) < 500:  # Skip very small chunks
+                print(f"STT: Skipping chunk {i+1} - too small ({len(chunk_data)} bytes)")
+                continue
+            
+            print(f"STT: Processing chunk {i+1}/{len(audio_chunks)} (size: {len(chunk_data)} bytes)")
+            try:
+                chunk_text = self.transcribe_audio(chunk_data, language_code, audio_format=audio_format)
+                
+                if chunk_text and chunk_text.strip():
+                    print(f"STT: Chunk {i+1} transcribed: '{chunk_text}'")
+                    all_transcripts.append(chunk_text.strip())
+                    successful_chunks += 1
+                else:
+                    print(f"STT: Chunk {i+1} returned no transcription (likely silence or noise)")
+            except Exception as e:
+                print(f"STT: Error processing chunk {i+1}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        print(f"STT: Successfully transcribed {successful_chunks}/{len(audio_chunks)} chunks")
+        
+        if not all_transcripts:
+            print("STT: No successful transcriptions from any chunk")
+            return None
+        
+        # Merge transcripts at sentence boundaries
+        merged_text = self._merge_transcripts(all_transcripts)
+        print(f"STT: Merged transcription from {len(all_transcripts)} chunks: '{merged_text}'")
+        
+        return merged_text
+    
+    def _merge_transcripts(self, transcripts: List[str]) -> str:
+        """
+        Merge multiple transcript chunks at sentence boundaries
+        
+        Args:
+            transcripts: List of transcript strings
+            
+        Returns:
+            Merged transcript with proper sentence boundaries
+        """
+        import re
+        
+        if not transcripts:
+            return ""
+        
+        # Join all transcripts
+        combined = " ".join(transcripts)
+        
+        # Clean up: remove duplicate words/phrases at boundaries
+        # Split by sentence boundaries
+        sentences = re.split(r'([.!?]\s*)', combined)
+        
+        # Reconstruct, removing duplicates
+        merged_sentences = []
+        seen_sentences = set()
+        
+        for i in range(0, len(sentences), 2):
+            if i < len(sentences):
+                sentence = sentences[i].strip()
+                punctuation = sentences[i+1] if i+1 < len(sentences) else ""
+                
+                # Normalize sentence for comparison (lowercase, no punctuation)
+                normalized = re.sub(r'[.!?,\s]+', ' ', sentence.lower()).strip()
+                
+                # Skip if we've seen this sentence before (duplicate detection)
+                if normalized and normalized not in seen_sentences:
+                    seen_sentences.add(normalized)
+                    merged_sentences.append(sentence + punctuation)
+        
+        result = " ".join(merged_sentences).strip()
+        
+        # Final cleanup: remove extra spaces
+        result = re.sub(r'\s+', ' ', result)
+        
+        return result
     
     def transcribe_stream(self, audio_stream: BinaryIO, language_code: str = "en-US",
                          sample_rate: int = 16000) -> Optional[str]:
@@ -173,4 +285,3 @@ def get_stt_service() -> STTService:
     if _stt_service is None:
         _stt_service = STTService()
     return _stt_service
-

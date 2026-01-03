@@ -33,7 +33,8 @@ class ApiService {
     audioBlob: Blob,
     userId: string,
     conversationId?: string,
-    languageCode: string = 'en-US'
+    languageCode: string = 'en-US',
+    userName?: string
   ): Promise<VoiceResponse> {
     try {
       const formData = new FormData();
@@ -44,6 +45,9 @@ class ApiService {
       formData.append('language_code', languageCode);
       if (conversationId) {
         formData.append('conversation_id', conversationId);
+      }
+      if (userName) {
+        formData.append('user_name', userName);
       }
 
       console.log(`Sending audio to backend: ${filename}, size: ${audioBlob.size} bytes, type: ${audioBlob.type}`);
@@ -105,7 +109,8 @@ class ApiService {
     text: string,
     userId: string,
     conversationId?: string,
-    generateAudio: boolean = false
+    generateAudio: boolean = false,
+    userName?: string
   ): Promise<TextResponse> {
     console.log(`Sending text to backend: "${text}", user: ${userId}, conversation: ${conversationId || 'new'}, audio: ${generateAudio}`);
     console.log(`Backend URL: ${this.baseUrl}/api/text/process`);
@@ -126,6 +131,7 @@ class ApiService {
           user_id: userId,
           conversation_id: conversationId,
           generate_audio: generateAudio, // Only generate audio if requested
+          user_name: userName,
         }),
         signal: controller.signal,
       });

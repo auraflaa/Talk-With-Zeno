@@ -7,11 +7,13 @@ interface TextChatProps {
     onSendMessage: (text: string) => void;
     onSwitchToVoice: () => void;
     onEndSession: () => void;
+    isProcessing?: boolean;
 }
 
-export const TextChat: React.FC<TextChatProps> = ({ messages, onSendMessage, onSwitchToVoice, onEndSession }) => {
+export const TextChat: React.FC<TextChatProps> = ({ messages, onSendMessage, onSwitchToVoice, onEndSession, isProcessing = false }) => {
     const [input, setInput] = useState("");
     const endRef = useRef<HTMLDivElement>(null);
+    const messagesContainerRef = useRef<HTMLDivElement>(null);
 
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
@@ -20,9 +22,25 @@ export const TextChat: React.FC<TextChatProps> = ({ messages, onSendMessage, onS
         setInput("");
     };
 
+    // Scroll to bottom when messages change or when processing starts/stops
     useEffect(() => {
-        endRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [messages]);
+        // Use setTimeout to ensure DOM is updated
+        setTimeout(() => {
+            if (endRef.current) {
+                endRef.current.scrollIntoView({ behavior: 'smooth' });
+            } else if (messagesContainerRef.current) {
+                // Fallback: scroll container to bottom
+                messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+            }
+        }, 100);
+    }, [messages, isProcessing]);
+    
+    // Initial scroll to bottom on mount
+    useEffect(() => {
+        if (messagesContainerRef.current) {
+            messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+        }
+    }, []);
 
     const isInputEmpty = !input.trim();
 
@@ -34,8 +52,13 @@ export const TextChat: React.FC<TextChatProps> = ({ messages, onSendMessage, onS
               Strict overflow control: auto vertical, hidden horizontal.
               Scrollbars are hidden via global CSS in index.html.
             */}
-            <div className="flex-1 overflow-y-auto overflow-x-hidden pb-32">
-                <div className="py-6 space-y-6">
+            <div ref={messagesContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden pb-32">
+                <div className="py-6 space-y-6 min-h-full">
+                    {messages.length === 0 && !isProcessing && (
+                        <div className="flex items-center justify-center h-full">
+                            <p className="text-base-content/50 text-sm">Start a conversation by typing a message below</p>
+                        </div>
+                    )}
                     {messages.map((msg) => (
                         <div key={msg.id} className={`chat ${msg.role === 'user' ? 'chat-end' : 'chat-start'}`}>
                             <div 
@@ -49,6 +72,16 @@ export const TextChat: React.FC<TextChatProps> = ({ messages, onSendMessage, onS
                             </div>
                         </div>
                     ))}
+                    {isProcessing && (
+                        <div className="chat chat-start animate-in fade-in duration-300">
+                            <div className="chat-bubble bg-base-200 text-base-content border border-base-200">
+                                <span className="inline-flex items-center gap-2">
+                                    <span className="loading loading-dots loading-sm text-primary"></span>
+                                    <span className="text-sm opacity-70">Thinking...</span>
+                                </span>
+                            </div>
+                        </div>
+                    )}
                     <div ref={endRef} />
                 </div>
             </div>
