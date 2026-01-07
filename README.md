@@ -59,7 +59,7 @@ The system follows a standard **frontend–backend architecture** with managed A
 ### AI Services
 
 - **Speech-to-Text (STT)**: Google Cloud Speech-to-Text (`phone_call` model for optimal latency)
-- **Language Model (LLM)**: Gemini 2.0 Flash (primary) with fallback to Gemini 2.5 Flash, Gemini 2.0 Flash Lite
+- **Language Model (LLM)**: Gemini 2.5 Flash (primary) with fallback to Gemini 2.0 Flash
 - **Text-to-Speech (TTS)**: Groq Orpheus TTS (primary) with Gemini TTS fallback
 
 ### Storage
