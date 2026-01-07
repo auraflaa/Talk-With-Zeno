@@ -15,6 +15,7 @@ export class AudioService {
   private currentAudioBlob: Blob | null = null; // Store blob to recreate URL if needed
   private currentAudioResolve: (() => void) | null = null; // Track Promise resolve for current audio
   private currentAudioReject: ((error: Error) => void) | null = null; // Track Promise reject for current audio
+  private isGreetingPlaying: boolean = false; // Track if greeting is playing (prevents cleanup from stopping it)
   private readonly MAX_CHUNKS = 1000; // Prevent memory leak from too many chunks
   
   // VAD (Voice Activity Detection) properties
@@ -214,6 +215,11 @@ export class AudioService {
       const currentState = this.mediaRecorder.state;
       console.log(`Stopping recording. Current state: ${currentState}`);
       
+      // CRITICAL: Reset speechStartTime when recording actually stops
+      // This is the only place where we should reset it (not in clearSpeechChunks)
+      this.speechStartTime = 0;
+      this.isCurrentlySpeaking = false;
+      
       if (currentState === 'inactive') {
         console.warn('Recording already stopped or inactive');
         // If already stopped but we have chunks, try to create blob anyway
@@ -322,8 +328,14 @@ export class AudioService {
   private cleanup(): void {
     console.log('Cleaning up audio service...');
     
-    // CRITICAL: Stop and resolve any pending audio playback
-    this.stopAudio();
+    // CRITICAL: Don't stop audio if greeting is playing (React Strict Mode causes unmount/remount)
+    if (this.isGreetingPlaying) {
+      console.log('AudioService: Skipping audio stop in cleanup - greeting is playing');
+      // Still stop VAD and recording, but don't stop audio playback
+    } else {
+      // CRITICAL: Stop and resolve any pending audio playback
+      this.stopAudio();
+    }
     
     // Stop VAD first
     this.stopVAD();
@@ -852,6 +864,12 @@ export class AudioService {
   }
 
   stopAudio(): void {
+    // CRITICAL: Don't stop audio if greeting is playing
+    if (this.isGreetingPlaying) {
+      console.log('AudioService: Skipping audio stop - greeting is playing');
+      return;
+    }
+    
     if (this.currentAudio) {
       try {
         console.log('Stopping current audio playback');
@@ -1268,10 +1286,24 @@ export class AudioService {
     this.speechChunks = [];
     this.lastSentChunkIndex = 0;
     this.audioChunks = []; // Also clear raw audio chunks (header is preserved separately)
-    // Reset speech detection state after processing is complete
-    this.speechStartTime = 0;
+    // CRITICAL: Don't reset speechStartTime here - keep it so hasDetectedSpeech() works for subsequent speech
+    // Only reset speechStartTime when recording actually stops (in stopRecording)
+    // This ensures that if user speaks again quickly, hasDetectedSpeech() still returns true
+    // this.speechStartTime = 0; // REMOVED - keep speechStartTime for hasDetectedSpeech()
     this.isCurrentlySpeaking = false;
     console.log(`AudioService: Cleared all speech chunks (${oldLength} → 0) for fresh start`);
+  }
+  
+  /**
+   * Mark greeting as playing (prevents cleanup from stopping it)
+   */
+  setGreetingPlaying(isPlaying: boolean): void {
+    this.isGreetingPlaying = isPlaying;
+    if (isPlaying) {
+      console.log('AudioService: Greeting marked as playing - cleanup will not stop audio');
+    } else {
+      console.log('AudioService: Greeting finished - cleanup can stop audio normally');
+    }
   }
 
   /**

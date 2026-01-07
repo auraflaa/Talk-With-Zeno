@@ -60,6 +60,22 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
     const sttErrorCountRef = useRef<number>(0); // Track consecutive STT errors
     const lastSttErrorTimeRef = useRef<number>(0); // Track when last STT error occurred
     
+    // Safety mechanism: Reset isProcessing if it gets stuck for too long
+    useEffect(() => {
+        if (!isProcessing) return;
+        
+        const safetyTimeout = setTimeout(() => {
+            if (isProcessing) {
+                console.warn('LiveInterface: isProcessing stuck for 30s, forcing reset');
+                setIsProcessing(false);
+                // Also reset VAD state
+                audioService.resetVADState();
+            }
+        }, 30000); // 30 seconds safety timeout
+        
+        return () => clearTimeout(safetyTimeout);
+    }, [isProcessing]);
+    
     useEffect(() => {
         userIdRef.current = userId;
     }, [userId]);
@@ -88,17 +104,21 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                 streamingChunkIntervalRef.current = null;
             }
             // Cleanup audio service
+            // CRITICAL: Don't force stop if greeting is playing (React Strict Mode causes unmount/remount)
+            // Let the greeting finish playing - it will clean up itself when done
+            if (isGreetingPlayingRef.current) {
+                console.log('LiveInterface: Skipping audio cleanup - greeting is playing (React Strict Mode unmount)');
+                // Don't stop anything if greeting is playing - let it finish naturally
+                return;
+            }
+            
             // CRITICAL: Don't force stop if mic should still be active (component might be re-rendering)
             // Only force stop if component is actually unmounting
             if (audioService.isRecording() && !isMicActive) {
                 audioService.forceStop();
-            }
-            // CRITICAL: Don't stop audio if greeting is playing (React Strict Mode causes unmount/remount)
-            // Let the greeting finish playing - it will clean up itself when done
-            if (!isGreetingPlayingRef.current) {
-                audioService.stopAudio();
             } else {
-                console.log('LiveInterface: Skipping audio stop - greeting is playing (React Strict Mode unmount)');
+                // Only stop audio if not recording (to avoid interrupting recording)
+                audioService.stopAudio();
             }
         };
     }, []);
@@ -261,6 +281,10 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                         
                         // Play audio immediately - ensure it plays completely
                         try {
+                            // CRITICAL: Set greeting flag BEFORE any async operations to prevent cleanup from stopping it
+                            isGreetingPlayingRef.current = true;
+                            audioService.setGreetingPlaying(true); // Also set in audioService
+                            
                             // Decode audio bytes first and create blob
                             const audioBytes = Uint8Array.from(atob(cachedGreeting.audioBase64), c => c.charCodeAt(0));
                             // Try WAV first, fallback to MP3 if needed
@@ -278,10 +302,8 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                             try {
                                 // Play audio and wait for it to complete
                                 console.log('GreetingService: Starting audio playback, waiting for completion...');
-                                isGreetingPlayingRef.current = true; // Mark greeting as playing (prevents VAD from stopping it)
                                 await audioService.playAudio(audioBlob);
                                 console.log('GreetingService: Cached greeting audio finished playing completely');
-                                isGreetingPlayingRef.current = false; // Mark greeting as finished
                             } catch (error) {
                                 // If WAV fails, try MP3 format
                                 if (error instanceof Error && !error.name.includes('AbortError')) {
@@ -296,11 +318,14 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                                     }
                                 } else if (error instanceof Error && error.name === 'AbortError') {
                                     console.log('GreetingService: Audio playback interrupted (user may have started speaking)');
-                                    isGreetingPlayingRef.current = false; // Reset flag on interruption
                                 } else {
                                     console.error('GreetingService: Error playing cached audio:', error);
-                                    isGreetingPlayingRef.current = false; // Reset flag on error
                                 }
+                            } finally {
+                                // CRITICAL: Always reset greeting flag, even if playback was interrupted or failed
+                                isGreetingPlayingRef.current = false;
+                                audioService.setGreetingPlaying(false); // Reset in audioService
+                                console.log('GreetingService: Greeting flag reset');
                             }
                         } catch (error) {
                             console.error('GreetingService: Error preparing cached audio:', error);
@@ -352,9 +377,11 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                                     try {
                                         // Play audio and wait for it to complete
                                         isGreetingPlayingRef.current = true; // Mark greeting as playing (prevents VAD from stopping it)
+                                        audioService.setGreetingPlaying(true); // Also set in audioService
                                         await audioService.playAudio(audioBlob);
                                         console.log('Fresh greeting audio finished playing completely');
                                         isGreetingPlayingRef.current = false; // Mark greeting as finished
+                                        audioService.setGreetingPlaying(false); // Reset in audioService
                                     } catch (err) {
                                         // If WAV fails, try MP3 format
                                         if (err instanceof Error && !err.name.includes('AbortError')) {
@@ -867,6 +894,10 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                         }
                     } catch (error) {
                         console.error('Streaming: Error processing LLM response:', error);
+                        // CRITICAL: Reset isProcessing on error so system can recover
+                        setIsProcessing(false);
+                        // Reset VAD state to allow new speech detection
+                        audioService.resetVADState();
                         if (isMountedRef.current) {
                             onReceiveMessage(`I'm sorry, I'm having trouble processing your voice. ${error instanceof Error ? error.message : 'Please try again.'}`);
                         }
@@ -1199,9 +1230,15 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                 } catch (error) {
                     if (error instanceof Error && error.name !== 'AbortError') {
                         console.error('VAD: Error processing utterance:', error);
+                        // Show user-friendly error message
+                        if (isMountedRef.current) {
+                            onReceiveMessage(`I'm sorry, I had trouble processing that. Please try again.`);
+                        }
                     }
                 } finally {
+                    // CRITICAL: Always reset isProcessing, even on error
                     setIsProcessing(false);
+                    console.log('VAD: Reset isProcessing in finally block (utterance processing complete)');
                 }
                 return; // Don't update audio level again for speech-ended signal
             }
@@ -1289,12 +1326,17 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
             // is likely real speech that VAD missed. In that case, force a best‑effort send.
             if (!audioService.hasDetectedSpeech()) {
                 if (estimatedDurationMs > 8000) {
-                    // Best‑effort fallback: send concatenated blob so the backend can try STT.
-                    // This may occasionally fail if the WebM header is invalid, but it ensures
-                    // the user’s second turn is at least attempted instead of silently discarded.
-                    warnWithTimestamp(`VAD Fallback: No speech detected but substantial audio (${estimatedDurationMs.toFixed(0)}ms) - forcing best-effort STT with concatenated WebM`);
-                    const blobType = allChunks[0]?.type || 'audio/webm';
-                    const speechBlob = new Blob(allChunks, { type: blobType });
+                    // Best‑effort fallback: send blob with proper header chunk prepended
+                    // CRITICAL: Use getAllChunksWithHeader() which ensures valid WebM header
+                    warnWithTimestamp(`VAD Fallback: No speech detected but substantial audio (${estimatedDurationMs.toFixed(0)}ms) - forcing best-effort STT with header-prefixed WebM`);
+                    // getAllChunksWithHeader() already called above, but ensure we use it
+                    const chunksWithHeader = audioService.getAllChunksWithHeader();
+                    if (chunksWithHeader.length === 0) {
+                        logWithTimestamp('VAD Fallback: No chunks available, skipping');
+                        return;
+                    }
+                    const blobType = chunksWithHeader[0]?.type || 'audio/webm';
+                    const speechBlob = new Blob(chunksWithHeader, { type: blobType });
                     processStreamChunk(speechBlob, true, userName).catch(err => {
                         errorWithTimestamp('VAD Fallback: Error processing best-effort chunks:', err);
                     });
@@ -1365,6 +1407,11 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
         // This gives more time for conversations, and the timer resets after each successful processing
         maxRecordingDurationRef.current = setTimeout(() => {
             if (!isMountedRef.current) return;
+            // CRITICAL: Don't force stop if greeting is playing
+            if (isGreetingPlayingRef.current) {
+                console.log('Max duration timeout: Skipping force stop - greeting is playing');
+                return;
+            }
             console.warn('Maximum recording duration reached (120s), auto-stopping...');
             if (isMicActive && !isProcessing && audioService.isRecording()) {
                 // Before stopping, try to process any accumulated chunks
