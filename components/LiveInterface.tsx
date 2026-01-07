@@ -1032,7 +1032,7 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                 
                 try {
                     // Get all accumulated chunks for this utterance
-                    const allChunks = audioService.getAllChunks();
+                    const allChunks = audioService.getAllChunksWithHeader();
                     console.log(`VAD: Found ${allChunks.length} chunks for utterance`);
                     
                     if (allChunks.length === 0) {

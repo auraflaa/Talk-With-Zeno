@@ -120,7 +120,7 @@ npm run dev
 
 **Code Status:** ✅ Implemented and verified (no linting errors)
 
-**Note:** Long-term fix requires backend remuxing with ffmpeg (post-hackathon)
+**Note:** Install ffmpeg now (mandatory for stable fallback): Once ffmpeg is on PATH, pydub/ffmpeg remuxing makes fallback audio reliable.
 
 ## 🚀 Quick Start Commands
 

@@ -418,6 +418,11 @@ Rules:
 - Use update commands when you learn new information about preferences, goals, or emotional states
 - Be proactive in detecting patterns (e.g., if user mentions stress multiple times, add it as a topic)
 - Current timestamp: {current_time}
+- DO NOT invent or change personalization unless the user clearly provides new evidence. Default to no update if unsure.
+- Only include UPDATE/ADD/EDIT/DELETE commands when you have a concrete, explicit signal from the user message or recent history.
+- If applying an update, keep it minimal and avoid overwriting unrelated fields.
+- Never delete or downgrade existing personalization unless the user explicitly asks for that change.
+- If you cannot justify an update, respond with no update commands.
 
 Example Response Format:
 "Ugh, that sounds really tough. I get why you'd feel that way. Want to talk more about it? [ADD_TOPIC:"work stress"] [ADD_EMOTIONAL_PATTERN:{{"emotion": "anxiety", "intensity": 0.6, "timestamp": "{current_time}"}}]"

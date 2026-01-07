@@ -7,6 +7,8 @@ import { logWithTimestamp, warnWithTimestamp, errorWithTimestamp } from '../util
 export class AudioService {
   private mediaRecorder: MediaRecorder | null = null;
   private audioChunks: Blob[] = [];
+  // Preserve the very first chunk to keep a valid EBML header for every utterance
+  private headerChunk: Blob | null = null;
   private stream: MediaStream | null = null;
   private currentAudio: HTMLAudioElement | null = null;
   private currentAudioUrl: string | null = null; // Track URL for cleanup
@@ -114,6 +116,10 @@ export class AudioService {
 
       this.mediaRecorder.ondataavailable = (event) => {
         if (event.data && event.data.size > 0) {
+          // Save the first chunk as header (contains EBML/codec metadata)
+          if (!this.headerChunk) {
+            this.headerChunk = event.data;
+          }
           // Prevent memory leak - limit chunk count
           if (this.audioChunks.length >= this.MAX_CHUNKS) {
             console.warn(`Maximum chunk limit reached (${this.MAX_CHUNKS}), removing oldest chunks`);
@@ -357,6 +363,7 @@ export class AudioService {
     // Clear references
     this.mediaRecorder = null;
     this.audioChunks = [];
+    this.headerChunk = null;
     this.speechChunks = [];
     this.lastSentChunkIndex = 0;
     this.isCurrentlySpeaking = false;
@@ -864,7 +871,15 @@ export class AudioService {
   getSpeechChunks(): Blob[] {
     // Return chunks since last sent index
     const newChunks = this.speechChunks.slice(this.lastSentChunkIndex);
-    return [...newChunks];
+    const result = [...newChunks];
+
+    // Prepend preserved header chunk so downstream always sees a valid EBML header.
+    // Avoid duplicating if headerChunk is already the first element.
+    if (this.headerChunk && result[0] !== this.headerChunk) {
+      return [this.headerChunk, ...result];
+    }
+
+    return result;
   }
 
   /**
@@ -872,6 +887,24 @@ export class AudioService {
    */
   getAllChunks(): Blob[] {
     return [...this.audioChunks];
+  }
+
+  /**
+   * Get all chunks ensuring the preserved header chunk is prepended.
+   * This keeps a valid EBML header even after per-utterance clears.
+   */
+  getAllChunksWithHeader(): Blob[] {
+    if (!this.headerChunk) {
+      return [...this.audioChunks];
+    }
+
+    // Avoid duplicating the header chunk if it's already the first element
+    const first = this.audioChunks[0];
+    if (first && first === this.headerChunk) {
+      return [...this.audioChunks];
+    }
+
+    return [this.headerChunk, ...this.audioChunks];
   }
 
   /**
@@ -947,7 +980,7 @@ export class AudioService {
     const oldLength = this.speechChunks.length;
     this.speechChunks = [];
     this.lastSentChunkIndex = 0;
-    this.audioChunks = []; // Also clear raw audio chunks
+    this.audioChunks = []; // Also clear raw audio chunks (header is preserved separately)
     // Reset speech detection state after processing is complete
     this.speechStartTime = 0;
     this.isCurrentlySpeaking = false;
