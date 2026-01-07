@@ -5,9 +5,12 @@ Supports Groq and Gemini TTS models with fallback
 
 import os
 import requests
-import google.generativeai as genai
+import warnings
 from typing import Optional, List
 from pathlib import Path
+# Suppress deprecation warning for google.generativeai (we'll migrate later)
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*google.generativeai.*')
+import google.generativeai as genai
 
 # Try to import Groq SDK
 try:
@@ -109,9 +112,16 @@ class TTSService:
                 return audio_content
                 
             except Exception as e:
-                print(f"Groq TTS: SDK error: {e}")
-                import traceback
-                traceback.print_exc()
+                # Handle rate limit errors gracefully (don't print full traceback)
+                if hasattr(e, 'status_code') and e.status_code == 429:
+                    print(f"Groq TTS: Rate limit error (429) - {str(e)}")
+                elif 'RateLimitError' in str(type(e).__name__) or 'rate_limit' in str(e).lower():
+                    print(f"Groq TTS: Rate limit error - {str(e)}")
+                else:
+                    # Only print full traceback for unexpected errors
+                    print(f"Groq TTS: SDK error: {e}")
+                    import traceback
+                    traceback.print_exc()
                 # Fall through to requests fallback
                 pass
         
@@ -145,7 +155,7 @@ class TTSService:
             print(f"Groq TTS: Using requests - model: {tts_model}, voice: {voice_id}")
             print(f"Groq TTS: Text length: {len(text)} characters")
             
-            response = requests.post(url, headers=headers, json=data, timeout=30)
+            response = requests.post(url, headers=headers, json=data, timeout=15)  # Reduced from 30s to 15s for faster failure
             
             print(f"Groq TTS: Response status: {response.status_code}")
             

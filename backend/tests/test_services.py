@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Add parent directory to path
-parent_dir = Path(__file__).parent.parent
+parent_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(parent_dir))
 
 # Load environment variables
@@ -326,6 +326,16 @@ def main():
 
 
 if __name__ == '__main__':
-    success = main()
-    sys.exit(0 if success else 1)
+    try:
+        success = main()
+        sys.stdout.flush()  # Ensure output is flushed
+        sys.exit(0 if success else 1)
+    except KeyboardInterrupt:
+        print("\n\n[INTERRUPTED] Test suite interrupted by user")
+        sys.exit(130)
+    except Exception as e:
+        print(f"\n\n[ERROR] Test suite failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 

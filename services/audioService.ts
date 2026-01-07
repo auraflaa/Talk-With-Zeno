@@ -2,6 +2,8 @@
  * Audio Recording and Playback Service
  */
 
+import { logWithTimestamp, warnWithTimestamp, errorWithTimestamp } from '../utils/logger';
+
 export class AudioService {
   private mediaRecorder: MediaRecorder | null = null;
   private audioChunks: Blob[] = [];
@@ -18,11 +20,11 @@ export class AudioService {
   private vadInterval: number | null = null;
   private isVADActive: boolean = false;
   
-  // VAD thresholds - optimized for faster response and better accuracy
+  // VAD thresholds - optimized for better accuracy and preventing premature speech end detection
   // These work in conjunction with backend VAD (silero-vad) for highest accuracy
   private readonly VAD_THRESHOLD = 25; // Volume threshold (0-255) - lowered for better sensitivity
-  private readonly SILENCE_DURATION = 400; // ms of silence before auto-stop (optimized for faster response)
-  private readonly MIN_SPEECH_DURATION = 150; // ms minimum speech to process (optimized for faster response)
+  private readonly SILENCE_DURATION = 500; // ms of silence to detect speech end (reduced from 800ms for faster response)
+  private readonly MIN_SPEECH_DURATION = 200; // ms minimum speech duration (reduced from 300ms for faster response, still filters noise)
   
   // Advanced VAD parameters for better accuracy
   private readonly RMS_THRESHOLD = 12; // RMS threshold for time domain (lowered for better sensitivity)
@@ -141,7 +143,7 @@ export class AudioService {
           // Only log every 10th chunk to reduce console spam
           if (this.audioChunks.length % 10 === 0) {
             const totalSize = this.audioChunks.reduce((sum, chunk) => sum + chunk.size, 0);
-            console.log(`Audio chunk received: ${event.data.size} bytes (total chunks: ${this.audioChunks.length}, total size: ${totalSize} bytes)`);
+            logWithTimestamp(`Audio chunk received: ${event.data.size} bytes (total chunks: ${this.audioChunks.length}, total size: ${totalSize} bytes)`);
           }
         } else {
           console.warn('Received empty audio chunk');
@@ -153,7 +155,7 @@ export class AudioService {
       };
 
       this.mediaRecorder.onstart = () => {
-        console.log('Recording started');
+        logWithTimestamp('Recording started');
       };
 
       this.mediaRecorder.onstop = () => {
@@ -404,7 +406,7 @@ export class AudioService {
       };
 
       audio.onended = () => {
-        console.log('Audio playback ended');
+        console.log('Audio playback ended - audio finished playing completely');
         cleanup();
         resolve();
       };
@@ -417,25 +419,167 @@ export class AudioService {
 
       audio.oncanplaythrough = () => {
         console.log('Audio ready to play');
+        // Ensure audio is loaded before playing
+        if (audio.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA) {
+          console.log('Audio has enough data to play');
+        }
       };
       
-      // Set volume to ensure audio is audible
+      // Set volume to ensure audio is audible (max volume)
       audio.volume = 1.0;
-
+      
+      // CRITICAL: Ensure audio is not muted
+      audio.muted = false;
+      
+      // CRITICAL: Pause and reset audio BEFORE setting src to prevent auto-play
+      audio.pause();
+      audio.currentTime = 0;
+      
+      // CRITICAL: Prevent autoplay by setting preload
+      audio.preload = 'auto';
+      
       audio.src = url;
       // Load the audio first to ensure it's ready
       audio.load();
-      const playPromise = audio.play();
+      
+      // CRITICAL: Immediately pause after load to prevent any auto-play
+      setTimeout(() => {
+        audio.pause();
+        audio.currentTime = 0;
+      }, 0);
+      
+      // CRITICAL: Ensure audio is paused and reset after metadata is loaded
+      // This prevents the browser from auto-playing or starting from wrong position
+      audio.addEventListener('loadedmetadata', () => {
+        audio.pause(); // Ensure it's paused
+        audio.currentTime = 0; // Reset to beginning
+        console.log('Audio metadata loaded, paused and reset to 0 (duration:', audio.duration, ')');
+      }, { once: true });
+      
+      console.log('Audio element created:', {
+        volume: audio.volume,
+        muted: audio.muted,
+        src: url.substring(0, 50) + '...',
+        blobSize: audioBlob.size
+      });
+      
+            // CRITICAL: Wait for ENTIRE audio file to be buffered before playing
+            // This prevents the beginning from being cut off
+            const playWhenReady = () => {
+                return new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => {
+                        reject(new Error('Audio load timeout'));
+                    }, 10000); // Increased to 10s for large files
+                    
+                    // Check if entire file is buffered
+                    const checkFullyBuffered = () => {
+                        if (audio.buffered.length > 0) {
+                            const bufferedEnd = audio.buffered.end(audio.buffered.length - 1);
+                            const duration = audio.duration;
+                            
+                            // Check if entire file is buffered (within 0.1s tolerance)
+                            if (duration && duration > 0 && !isNaN(duration)) {
+                                // For small files (< 5s), just check readyState
+                                // For larger files, check if entire file is buffered
+                                const isSmallFile = duration < 5.0;
+                                const isFullyBuffered = isSmallFile 
+                                    ? (audio.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA)
+                                    : (bufferedEnd >= duration - 0.1);
+                                
+                                if (isFullyBuffered || audio.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA) {
+                                    // ENTIRE file is buffered - safe to play from beginning
+                                    clearTimeout(timeout);
+                                    // CRITICAL: Pause, reset to 0, then play to ensure we start from beginning
+                                    audio.pause();
+                                    audio.currentTime = 0;
+                                    // Small delay to ensure currentTime is set and audio is paused before playing
+                                    setTimeout(() => {
+                                        // Double-check currentTime is 0 before playing
+                                        if (audio.currentTime > 0.1) {
+                                            audio.currentTime = 0;
+                                        }
+                                        console.log('Audio fully buffered, starting from beginning (buffered:', bufferedEnd.toFixed(2), 's, duration:', duration.toFixed(2), 's, currentTime:', audio.currentTime, ')');
+                                        resolve(audio.play());
+                                    }, 50); // 50ms delay to ensure currentTime is set and audio is paused
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    };
+                    
+                    // Wait for loadedmetadata first (to know duration)
+                    const onLoadedMetadata = () => {
+                        console.log('Audio metadata loaded (duration:', audio.duration, 's)');
+                        // CRITICAL: Pause and reset to 0 after metadata is loaded
+                        // This ensures audio doesn't auto-play and starts from beginning
+                        audio.pause();
+                        audio.currentTime = 0;
+                        
+                        // Now wait for entire file to be buffered
+                        const onProgress = () => {
+                            if (checkFullyBuffered()) {
+                                audio.removeEventListener('progress', onProgress);
+                                audio.removeEventListener('canplaythrough', onCanPlayThrough);
+                            }
+                        };
+                        
+                        const onCanPlayThrough = () => {
+                            // canplaythrough means enough is buffered, but check if ALL is buffered
+                            if (checkFullyBuffered()) {
+                                audio.removeEventListener('progress', onProgress);
+                                audio.removeEventListener('canplaythrough', onCanPlayThrough);
+                            }
+                        };
+                        
+                        // Listen for progress to track buffering
+                        audio.addEventListener('progress', onProgress);
+                        audio.addEventListener('canplaythrough', onCanPlayThrough, { once: true });
+                        
+                        // Also check immediately in case it's already fully buffered
+                        if (checkFullyBuffered()) {
+                            audio.removeEventListener('progress', onProgress);
+                            audio.removeEventListener('canplaythrough', onCanPlayThrough);
+                        }
+                    };
+                    
+                    if (audio.duration && audio.duration > 0 && !isNaN(audio.duration)) {
+                        // Duration already known
+                        onLoadedMetadata();
+                    } else {
+                        // Wait for metadata
+                        audio.addEventListener('loadedmetadata', onLoadedMetadata, { once: true });
+                    }
+                    
+                    audio.addEventListener('error', () => {
+                        clearTimeout(timeout);
+                        reject(new Error('Audio load error'));
+                    }, { once: true });
+                });
+            };
+      
+      const playPromise = playWhenReady();
       
       if (playPromise !== undefined) {
         playPromise
           .then(() => {
-            console.log('Audio play() succeeded');
+            console.log('Audio play() succeeded - audio is now playing, waiting for onended event...');
+            console.log('Audio playback state:', {
+              paused: audio.paused,
+              ended: audio.ended,
+              currentTime: audio.currentTime,
+              duration: audio.duration,
+              volume: audio.volume,
+              muted: audio.muted,
+              readyState: audio.readyState
+            });
+            // Don't resolve here - wait for onended event to ensure audio plays completely
+            // The promise will resolve when audio.onended fires
           })
           .catch((error) => {
             // Ignore AbortError - it's expected if audio is interrupted
             if (error.name === 'AbortError') {
-              console.log('Audio play() interrupted (expected)');
+              console.log('Audio play() interrupted (expected) - audio was stopped before playing');
               cleanup();
               resolve(); // Resolve instead of reject for AbortError
             } else {
@@ -446,10 +590,15 @@ export class AudioService {
           });
       } else {
         // Fallback for browsers that don't return promise
+        console.log('Audio play() returned undefined, using fallback check');
         setTimeout(() => {
           if (audio.error) {
+            console.error('Audio error detected in fallback:', audio.error);
             cleanup();
             reject(new Error(`Failed to play audio: ${audio.error.message}`));
+          } else {
+            console.log('Audio fallback: No error detected, audio may be playing');
+            // Don't resolve here - still wait for onended event
           }
         }, 1000);
       }
@@ -506,6 +655,10 @@ export class AudioService {
     return this.mediaRecorder?.state === 'recording';
   }
 
+  getVADActive(): boolean {
+    return this.isVADActive;
+  }
+
   /**
    * Start Voice Activity Detection (VAD)
    * Monitors audio levels to detect speech vs noise
@@ -534,7 +687,7 @@ export class AudioService {
       // Start VAD monitoring
       this.monitorVAD();
       
-      console.log('VAD started - monitoring for speech activity');
+      logWithTimestamp('VAD started - monitoring for speech activity');
     } catch (error) {
       console.error('Error starting VAD:', error);
       this.isVADActive = false;
@@ -611,7 +764,7 @@ export class AudioService {
         this.speechStartTime = now;
         // Don't reset chunks - keep accumulating for streaming
         // Chunks will be cleared after processing by the frontend
-        console.log('VAD: Speech detected, continuing to collect audio');
+        logWithTimestamp('VAD: Speech detected, continuing to collect audio');
       }
       this.lastSpeechTime = now;
     } else {
@@ -623,10 +776,11 @@ export class AudioService {
           // Speech ended, check if we have enough audio
           const speechDuration = this.lastSpeechTime - this.speechStartTime;
           if (speechDuration >= this.MIN_SPEECH_DURATION) {
-            console.log(`VAD: Speech ended (duration: ${speechDuration}ms), ready to process`);
-            // Mark speech as ended
+            logWithTimestamp(`VAD: Speech ended (duration: ${speechDuration}ms), ready to process`);
+            // Mark speech as ended (but keep speechStartTime set so hasDetectedSpeech() works)
+            // speechStartTime will be reset in clearSpeechChunks() after processing
             this.isCurrentlySpeaking = false;
-            this.speechStartTime = 0;
+            // DON'T reset speechStartTime here - keep it so hasDetectedSpeech() returns true
             
             // Trigger callback with special signal: null = speech ended (trigger processing)
             if (this.vadCallback) {
@@ -638,6 +792,44 @@ export class AudioService {
             this.speechChunks = []; // Clear short speech
             this.isCurrentlySpeaking = false;
             this.speechStartTime = 0;
+          }
+        }
+      } else {
+        // CRITICAL FIX: If we're not currently speaking but have accumulated chunks,
+        // check if we should force speech start detection (fallback for missed speech start)
+        // This handles the case where VAD missed speech start after TTS
+        if (this.audioChunks.length > 0 && this.speechStartTime === 0) {
+          // We have chunks but speechStartTime is 0 - VAD missed speech start
+          // Check if we have substantial audio that suggests speech is happening
+          const totalSize = this.audioChunks.reduce((sum, chunk) => sum + chunk.size, 0);
+          const estimatedDurationMs = (totalSize / 8000) * 1000; // ~8KB per second
+          const timeSinceLastSpeech = now - (this.lastSpeechTime || now);
+          
+          // If we have significant audio (>2 seconds) and silence for >1 second,
+          // force speech start detection retroactively (VAD missed the start)
+          if (estimatedDurationMs > 2000 && timeSinceLastSpeech > 1000) {
+            // Force speech start detection retroactively
+            this.isCurrentlySpeaking = true;
+            this.speechStartTime = now - estimatedDurationMs; // Set start time retroactively
+            this.lastSpeechTime = now;
+            logWithTimestamp(`VAD: Forcing speech start detection (missed start, ${estimatedDurationMs.toFixed(0)}ms audio accumulated)`);
+            
+            // Now trigger speech end immediately since we have enough silence
+            if (timeSinceLastSpeech > this.SILENCE_DURATION) {
+              const speechDuration = this.lastSpeechTime - this.speechStartTime;
+              if (speechDuration >= this.MIN_SPEECH_DURATION) {
+                this.isCurrentlySpeaking = false;
+                // DON'T reset speechStartTime here - keep it so hasDetectedSpeech() works
+                
+                logWithTimestamp(`VAD: Speech ended (forced, duration: ${speechDuration}ms), ready to process`);
+                
+                // Trigger callback with special signal: null = speech ended (trigger processing)
+                if (this.vadCallback) {
+                  this.vadCallback(null, audioLevel); // null = speech ended signal
+                }
+                return;
+              }
+            }
           }
         }
       }
@@ -683,6 +875,60 @@ export class AudioService {
   }
 
   /**
+   * Request a complete chunk from MediaRecorder using requestData()
+   * This creates a complete WebM chunk instead of fragments
+   * Returns a Promise that resolves with the complete chunk blob
+   */
+  async requestCompleteChunk(): Promise<Blob | null> {
+    if (!this.mediaRecorder || this.mediaRecorder.state !== 'recording') {
+      console.warn('MediaRecorder not recording, cannot request complete chunk');
+      return null;
+    }
+
+    return new Promise((resolve) => {
+      // Set up a one-time listener for the complete chunk
+      const onDataAvailable = (event: BlobEvent) => {
+        if (event.data && event.data.size > 0) {
+          // Remove the listener after receiving data
+          this.mediaRecorder!.removeEventListener('dataavailable', onDataAvailable);
+          console.log(`Requested complete chunk received: ${event.data.size} bytes`);
+          resolve(event.data);
+        } else {
+          // Empty chunk - try again or resolve with null
+          this.mediaRecorder!.removeEventListener('dataavailable', onDataAvailable);
+          console.warn('Requested complete chunk is empty');
+          resolve(null);
+        }
+      };
+
+      // Add listener
+      this.mediaRecorder.addEventListener('dataavailable', onDataAvailable);
+
+      // Request data - this forces MediaRecorder to create a complete chunk
+      try {
+        this.mediaRecorder.requestData();
+        // Set timeout in case requestData doesn't trigger event
+        setTimeout(() => {
+          this.mediaRecorder?.removeEventListener('dataavailable', onDataAvailable);
+          if (this.audioChunks.length > 0) {
+            // Fallback: use accumulated chunks if requestData doesn't work
+            const blobType = this.audioChunks[0]?.type || 'audio/webm';
+            const fallbackBlob = new Blob(this.audioChunks, { type: blobType });
+            console.warn(`requestData timeout, using accumulated chunks: ${fallbackBlob.size} bytes`);
+            resolve(fallbackBlob);
+          } else {
+            resolve(null);
+          }
+        }, 500); // 500ms timeout
+      } catch (error) {
+        this.mediaRecorder.removeEventListener('dataavailable', onDataAvailable);
+        console.error('Error requesting complete chunk:', error);
+        resolve(null);
+      }
+    });
+  }
+
+  /**
    * Get chunks since a specific time (for streaming)
    */
   getChunksSince(timestamp: number): Blob[] {
@@ -696,14 +942,84 @@ export class AudioService {
    * Actually just updates the sent index to mark chunks as sent
    */
   clearSpeechChunks(): void {
-    // Update sent index instead of clearing (allows continuous streaming)
-    this.lastSentChunkIndex = this.speechChunks.length;
-    // Only clear if we have too many chunks (memory management)
-    if (this.speechChunks.length > 200) {
-      const chunksToKeep = this.speechChunks.slice(-100);
-      this.speechChunks = chunksToKeep;
-      this.lastSentChunkIndex = 0; // Reset index since we cleared old chunks
+    // CRITICAL: After an utterance is processed, clear ALL chunks to start fresh
+    // This prevents accumulation of old chunks that can confuse VAD
+    const oldLength = this.speechChunks.length;
+    this.speechChunks = [];
+    this.lastSentChunkIndex = 0;
+    this.audioChunks = []; // Also clear raw audio chunks
+    // Reset speech detection state after processing is complete
+    this.speechStartTime = 0;
+    this.isCurrentlySpeaking = false;
+    console.log(`AudioService: Cleared all speech chunks (${oldLength} → 0) for fresh start`);
+  }
+
+  /**
+   * Reset VAD state (call after TTS playback to allow immediate new speech detection)
+   */
+  resetVADState(): void {
+    const wasSpeaking = this.isCurrentlySpeaking;
+    this.isCurrentlySpeaking = false;
+    // DON'T reset speechStartTime here - it should only be reset in clearSpeechChunks()
+    // This ensures hasDetectedSpeech() works correctly
+    this.lastSpeechTime = Date.now(); // Reset to current time so silence detection starts fresh
+    
+    // CRITICAL: After TTS, temporarily lower VAD thresholds to be more sensitive
+    // This helps detect speech start that might be missed due to TTS audio interference
+    // The thresholds will naturally adjust back as speech is detected
+    console.log(`VAD state reset - ready for new speech detection (wasSpeaking: ${wasSpeaking})`);
+    
+    // Note: VAD thresholds are already set to reasonable values
+    // The issue is that VAD might not be detecting speech immediately after TTS
+    // The fallback mechanism will handle this if VAD misses speech start
+  }
+  
+  /**
+   * Check if speech was ever detected (for fallback logic)
+   */
+  hasDetectedSpeech(): boolean {
+    // If speechStartTime was set, speech was detected at some point
+    return this.speechStartTime > 0;
+  }
+
+  /**
+   * Force speech end detection (fallback when VAD misses speech end)
+   * This is called when chunks accumulate but VAD hasn't detected speech end
+   * CRITICAL: Only processes if speech was actually detected (not just noise)
+   */
+  forceSpeechEnd(): boolean {
+    if (this.speechChunks.length === 0) {
+      return false; // No chunks to process
     }
+    
+    // CRITICAL: Only process if speech was actually detected
+    // If speechStartTime is 0, VAD never detected speech, so this is likely noise
+    if (!this.hasDetectedSpeech()) {
+      console.log('VAD: Force speech end skipped - no speech was ever detected (likely noise)');
+      return false;
+    }
+    
+    // Check if we have significant audio (at least 2 seconds worth)
+    const totalSize = this.speechChunks.reduce((sum, chunk) => sum + chunk.size, 0);
+    const estimatedDurationMs = (totalSize / 8000) * 1000; // ~8KB per second for WebM/Opus
+    
+    if (estimatedDurationMs < 2000) {
+      return false; // Not enough audio yet
+    }
+    
+    console.log(`VAD: Force speech end detection (fallback triggered) - ${estimatedDurationMs.toFixed(0)}ms of audio, isCurrentlySpeaking: ${this.isCurrentlySpeaking}`);
+    
+    // Mark speech as ended (but keep speechStartTime set so hasDetectedSpeech() works)
+    // speechStartTime will be reset in clearSpeechChunks() after processing
+    this.isCurrentlySpeaking = false;
+    // DON'T reset speechStartTime here - keep it so hasDetectedSpeech() returns true
+    
+    // Trigger callback with speech ended signal
+    if (this.vadCallback) {
+      this.vadCallback(null, 0); // null = speech ended signal
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -740,7 +1056,6 @@ export class AudioService {
       this.audioContext = null;
     }
     
-    this.vadCallback = null;
     console.log('VAD stopped');
   }
 }

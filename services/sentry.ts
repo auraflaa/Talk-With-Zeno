@@ -3,9 +3,11 @@
  * Initializes and configures Sentry for frontend error tracking
  */
 
+// Import Sentry - it's now installed, but we'll handle errors gracefully
 import * as Sentry from '@sentry/react';
 
 export function initSentry(): boolean {
+  
   const sentryDsn = import.meta.env.VITE_SENTRY_DSN as string;
   
   if (!sentryDsn) {
@@ -66,14 +68,24 @@ export function initSentry(): boolean {
 
 // Helper function to manually capture errors
 export function captureError(error: Error, context?: Record<string, any>): void {
-  if (context) {
-    Sentry.setContext('additional', context);
+  try {
+    if (context) {
+      Sentry.setContext('additional', context);
+    }
+    Sentry.captureException(error);
+  } catch (e) {
+    // Silently fail if Sentry is not properly initialized
+    console.warn('Sentry error capture failed:', e);
   }
-  Sentry.captureException(error);
 }
 
 // Helper function to capture messages
 export function captureMessage(message: string, level: Sentry.SeverityLevel = 'info'): void {
-  Sentry.captureMessage(message, level);
+  try {
+    Sentry.captureMessage(message, level);
+  } catch (e) {
+    // Silently fail if Sentry is not properly initialized
+    console.warn('Sentry message capture failed:', e);
+  }
 }
 

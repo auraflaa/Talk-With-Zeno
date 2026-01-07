@@ -5,11 +5,16 @@ Handles voice input pipeline: STT -> LLM -> TTS
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import os
 import io
 import uuid
 import time
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
+import threading
 
 # Initialize logger
 from backend.services.logger_service import get_logger
@@ -24,6 +29,20 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 # CORS configuration - allow all origins for development, restrict in production
 allowed_origins = os.getenv('ALLOWED_ORIGINS', '*').split(',')
 CORS(app, origins=allowed_origins, supports_credentials=True)
+
+# Rate limiting configuration
+# Use in-memory storage for prototype (use Redis for production)
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per hour", "50 per minute"],
+    storage_uri="memory://",
+    strategy="fixed-window"
+)
+
+# Global thread pool for background STT processing (shared across all requests)
+# This allows STT processing to happen in parallel without blocking other requests
+STT_PROCESSOR_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="stt_processor")
 
 # Lazy-load services to ensure env vars are loaded first
 # Services will be initialized on first use
@@ -85,7 +104,40 @@ def health_check():
     }), 200
 
 
+@app.route('/api/metrics', methods=['GET'])
+def get_metrics():
+    """Get metrics summary for monitoring"""
+    try:
+        from backend.services.metrics_service import get_metrics_service
+        metrics = get_metrics_service()
+        summary = metrics.get_metrics_summary()
+        
+        # Add system info
+        try:
+            import psutil
+            import os
+            process = psutil.Process(os.getpid())
+            cpu_percent = process.cpu_percent(interval=0.1)
+            memory_info = process.memory_info()
+            
+            summary['system'] = {
+                'cpu_percent': cpu_percent,
+                'memory_mb': memory_info.rss / 1024 / 1024,
+                'memory_percent': process.memory_percent()
+            }
+        except ImportError:
+            summary['system'] = {'error': 'psutil not available'}
+        except Exception as e:
+            summary['system'] = {'error': str(e)}
+        
+        return jsonify(summary), 200
+    except Exception as e:
+        logger.error(f"Error getting metrics: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/voice/process', methods=['POST'])
+@limiter.limit("10 per minute")  # Limit voice processing to 10 requests per minute
 def process_voice():
     """
     Main voice processing endpoint
@@ -381,23 +433,26 @@ def process_voice():
 
 
 @app.route('/api/voice/stream/chunk', methods=['POST'])
+@limiter.limit("30 per minute")  # Reduced for turn-based STT (one request per utterance)
 def process_stream_chunk():
     """
-    Streaming STT endpoint - processes audio chunks continuously
-    Returns text for each chunk, or triggers LLM when noise is detected
+    Turn-based STT endpoint - processes complete utterances (not continuous chunks)
+    
+    Architecture: Frontend buffers audio until VAD detects speech end, then sends
+    ONE complete utterance for transcription. This reduces API calls and server load.
     
     Request:
-        - audio: Audio chunk (multipart/form-data)
+        - audio: Complete audio utterance (multipart/form-data)
         - session_id: Streaming session ID (required)
         - user_id: User identifier (required)
         - conversation_id: Optional conversation ID
         - language_code: Optional language code (default: en-US)
-        - is_final: Optional flag to force processing (default: false)
+        - is_final: Should always be true for turn-based STT (default: false for backward compat)
     
     Returns:
-        - chunk_text: Transcribed text for this chunk (if any)
-        - is_noise: True if chunk contains only noise
-        - merged_text: Merged text from all chunks (if noise detected)
+        - chunk_text: Transcribed text for the utterance
+        - is_noise: True if utterance contains only noise
+        - merged_text: Same as chunk_text (for backward compatibility)
         - should_process: True if should send to LLM
         - session_id: Session ID
     """
@@ -405,20 +460,23 @@ def process_stream_chunk():
         from backend.services.streaming_service import get_streaming_service
         streaming_service = get_streaming_service()
         
-        # Get request data
-        session_id = request.form.get('session_id') or ''
-        user_id = request.form.get('user_id')
+        # Get request data - support both form data and headers (for session creation)
+        session_id = request.form.get('session_id') or request.headers.get('X-Session-Id') or ''
+        user_id = request.form.get('user_id') or request.headers.get('X-User-Id')
         if not user_id:
             return jsonify({"error": "user_id is required"}), 400
         
-        user_name = request.form.get('user_name')
-        conversation_id = request.form.get('conversation_id')
-        language_code = request.form.get('language_code', 'en-US')
+        user_name = request.form.get('user_name') or request.headers.get('X-User-Name')
+        conversation_id = request.form.get('conversation_id') or request.headers.get('X-Conversation-Id')
+        language_code = request.form.get('language_code') or request.headers.get('X-Language-Code', 'en-US')
         is_final = request.form.get('is_final', 'false').lower() == 'true'
+        
+        # Check if this is a session creation request (empty body with X-Create-Session header)
+        is_create_session = request.headers.get('X-Create-Session', 'false').lower() == 'true'
         
         # Get or create session
         session = streaming_service.get_session(session_id)
-        if not session:
+        if not session or is_create_session:
             # Create new session
             if not conversation_id:
                 conversation_id = str(uuid.uuid4())
@@ -427,8 +485,29 @@ def process_stream_chunk():
             if not session:
                 return jsonify({"error": "Failed to create session"}), 500
         
-        # Get audio chunk
+            # If this was a session creation request, return early with just the session_id
+            if is_create_session:
+                return jsonify({
+                    "session_id": session_id,
+                    "conversation_id": conversation_id,
+                    "chunk_text": "",
+                    "is_noise": False,
+                    "merged_text": "",
+                    "should_process": False
+                }), 200
+        
+        # Get audio chunk (not required for session creation)
         if 'audio' not in request.files:
+            # If no audio but we have a session, return empty response (session is ready)
+            if session:
+                return jsonify({
+                    "session_id": session_id,
+                    "conversation_id": session.conversation_id,
+                    "chunk_text": "",
+                    "is_noise": False,
+                    "merged_text": "",
+                    "should_process": False
+                }), 200
             return jsonify({"error": "audio chunk is required"}), 400
         
         audio_file = request.files['audio']
@@ -436,7 +515,7 @@ def process_stream_chunk():
         
         # Handle empty or very small chunks (for noise detection)
         if len(audio_data) < 100:  # Too small to be valid audio
-            print(f"Streaming: Received very small chunk ({len(audio_data)} bytes) - treating as noise/silence")
+            logger.debug(f"Streaming: Received very small chunk ({len(audio_data)} bytes) - treating as noise/silence")
             # Check if we have previous text chunks to process
             merged_text = session.get_merged_text()
             if merged_text and len(merged_text.strip()) >= 2:
@@ -459,8 +538,13 @@ def process_stream_chunk():
                     "conversation_id": session.conversation_id
                 }), 200
         
-        # Add chunk to session
-        session.add_chunk(audio_data)
+        # Allow concurrent processing - don't block new chunks while processing
+        # This enables recording while TTS is playing
+        # Note: We still mark as processing, but we allow chunks to accumulate
+        # The processing flag prevents duplicate processing of the same chunk set
+        
+        # Mark session as processing
+        session.is_processing = True
         
         # Detect audio format
         filename = audio_file.filename or 'audio.webm'
@@ -474,20 +558,87 @@ def process_stream_chunk():
         if not svcs['stt'].groq_client and not svcs['stt'].google_client:
             return jsonify({"error": "STT service not available"}), 500
         
-        # NOTE: Backend VAD (silero-vad/webrtcvad) requires PCM audio, not WebM/Opus
-        # We cannot use backend VAD on WebM chunks directly - it will incorrectly reject all audio
-        # Instead, let STT process the audio and use STT results to determine if it's noise
-        # Frontend VAD is sufficient for initial filtering
-        # Backend VAD can be used later if we convert WebM to PCM (requires additional processing)
-        use_backend_vad = False  # Disabled for WebM - VAD requires PCM audio
+        # Backend VAD: Now supports WebM/Opus conversion to PCM
+        # CRITICAL FIX: When is_final=True, frontend already did VAD and sent complete utterance
+        # Trust frontend VAD for final chunks, only use backend VAD for intermediate chunks
+        use_backend_vad = not is_final  # Only use backend VAD for non-final chunks
+        vad_result = None
         
-        # Add chunk to session for accumulation (only if valid size)
-        # Empty or very small chunks create invalid WebM files
+        # For final chunks, trust frontend VAD (frontend already filtered noise)
+        # For non-final chunks, use backend VAD to filter noise early
+        if use_backend_vad and len(audio_data) >= 1000:  # Lowered threshold from 2KB to 1KB for better detection
+            try:
+                from backend.services.vad_service import get_vad_service
+                vad_service = get_vad_service()
+                # VAD service will convert WebM to PCM automatically
+                vad_result = vad_service.is_speech(audio_data, sample_rate=16000, audio_format=audio_format)
+                logger.debug(f"VAD: Detected speech={vad_result} for {audio_format} chunk ({len(audio_data)} bytes, is_final={is_final})")
+                
+                # If VAD detects NO speech, treat as noise and skip STT processing
+                # BUT: Only do this for non-final chunks (intermediate chunks)
+                if not vad_result:
+                    logger.info(f"VAD: No speech detected in intermediate chunk ({len(audio_data)} bytes) - treating as noise, skipping STT")
+                    merged_text = session.get_merged_text()
+                    if merged_text and len(merged_text.strip()) >= 2:
+                        # We have accumulated text from previous chunks, process it
+                        return jsonify({
+                            "chunk_text": "",
+                            "is_noise": True,
+                            "merged_text": merged_text,
+                            "should_process": True,
+                            "session_id": session_id,
+                            "conversation_id": session.conversation_id
+                        }), 200
+                    else:
+                        # No accumulated text, just mark as noise and skip processing
+                        return jsonify({
+                            "chunk_text": "",
+                            "is_noise": True,
+                            "should_process": False,
+                            "session_id": session_id,
+                            "conversation_id": session.conversation_id
+                        }), 200
+            except Exception as e:
+                logger.warning(f"VAD: Error during speech detection: {e}")
+                vad_result = None  # Fall back to STT-based detection
+        elif is_final:
+            # For final chunks, assume speech (frontend VAD already filtered)
+            vad_result = True
+            logger.debug(f"VAD: Trusting frontend VAD for final chunk ({len(audio_data)} bytes) - assuming speech")
+        
+        # Add chunk to session for accumulation (only if valid size AND VAD detected speech)
+        # CRITICAL FIX: For final chunks, always accumulate (frontend VAD already filtered)
+        # For non-final chunks, use backend VAD to filter noise
         if audio_data and len(audio_data) >= 100:
-            session.add_chunk(audio_data)
+            # For final chunks, always accumulate (trust frontend VAD)
+            # For non-final chunks, only accumulate if VAD detected speech
+            should_accumulate = False
+            if is_final:
+                # Final chunk - trust frontend VAD, always accumulate
+                should_accumulate = True
+                logger.debug(f"Streaming: Final chunk - trusting frontend VAD, accumulating ({len(audio_data)} bytes)")
+            elif vad_result is None or vad_result:  # None = VAD not available, True = speech detected
+                # Non-final chunk - use backend VAD result
+                should_accumulate = True
+                logger.debug(f"Streaming: Backend VAD detected speech, accumulating ({len(audio_data)} bytes)")
+            
+            if should_accumulate:
+                session.add_chunk(audio_data)
+            else:
+                # VAD detected no speech in non-final chunk - don't accumulate, treat as noise
+                logger.debug(f"Streaming: Backend VAD detected no speech in non-final chunk, skipping accumulation ({len(audio_data)} bytes)")
+                merged_text = session.get_merged_text() if session.text_chunks else ""
+                return jsonify({
+                    "chunk_text": "",
+                    "is_noise": True,
+                    "should_process": bool(merged_text and len(merged_text.strip()) >= 2),
+                    "merged_text": merged_text,
+                    "session_id": session_id,
+                    "conversation_id": session.conversation_id
+                })
         else:
             # Empty or very small chunk - treat as noise, don't accumulate
-            print(f"Streaming: Skipping empty/small chunk ({len(audio_data) if audio_data else 0} bytes)")
+            logger.debug(f"Streaming: Skipping empty/small chunk ({len(audio_data) if audio_data else 0} bytes)")
             merged_text = session.get_merged_text() if session.text_chunks else ""
             return jsonify({
                 "chunk_text": "",
@@ -499,99 +650,575 @@ def process_stream_chunk():
             })
         
         # Accumulate chunks before processing - WebM needs larger segments for valid files
-        # 30KB ≈ 3-4 seconds of audio at typical WebM/Opus bitrates (~64kbps)
-        # Process more frequently to prevent chunks from growing too large and becoming invalid
+        # Balance between accuracy and speed: smaller chunks = faster response
+        # 20KB ≈ 2-3 seconds of audio at typical WebM/Opus bitrates (~64kbps)
+        # Reduced minimum for faster response while maintaining reasonable accuracy
         total_accumulated = sum(len(chunk) for chunk in session.audio_chunks)
-        MIN_CHUNK_SIZE_FOR_STT = 30000  # 30KB minimum for 3-4 seconds of audio (faster processing)
-        MAX_CHUNK_SIZE_FOR_STT = 300000  # 300KB maximum (≈20 seconds) - prevent Google STT "too long" errors and invalid WebM
+        MIN_CHUNK_SIZE_FOR_STT = 15000  # 15KB minimum for 1.5-2 seconds of audio (faster response, prevent accumulation)
+        MAX_CHUNK_SIZE_FOR_STT = 100000  # 100KB maximum per individual chunk (≈6 seconds) - prevent STT errors
+        # Note: Total accumulated can be larger - we'll split large accumulated audio into segments
         
         chunk_text = None
         
+        # PRIORITY FIX #1: Stop per-chunk STT calls - only process complete utterances
         # Process if:
-        # 1. We have enough accumulated audio (40KB)
-        # 2. Chunk is getting too large (1MB) - force processing to prevent errors
-        # 3. This is the final chunk
-        should_process = total_accumulated >= MIN_CHUNK_SIZE_FOR_STT or total_accumulated >= MAX_CHUNK_SIZE_FOR_STT or is_final
+        # 1. This is the final chunk (complete utterance from frontend VAD)
+        # 2. Audio is getting very large (>200KB) - force processing to prevent memory issues
+        # Note: We no longer process on MIN_CHUNK_SIZE threshold - frontend sends complete utterances
+        should_process = is_final or total_accumulated >= 200000
+        
+        # If audio is very large, log it for debugging
+        if total_accumulated > 200000:
+            logger.warning(f"Streaming: Large accumulated audio detected ({total_accumulated} bytes, {total_accumulated/1024:.1f}KB) - will split into segments")
         
         if should_process:
-            # Merge all accumulated chunks into one audio segment
-            accumulated_audio = b''.join(session.audio_chunks)
-            print(f"Streaming: Processing accumulated audio (chunks: {len(session.audio_chunks)}, total size: {len(accumulated_audio)} bytes, format: {audio_format})")
+            # IMPORTANT: WebM chunks cannot be simply concatenated - WebM has container format
+            # Process individual valid chunks first (most recent first for better accuracy)
+            # This avoids creating invalid WebM files from concatenation
+            
+            # METRICS & LOGGING: Start utterance tracking
+            utterance_id = str(uuid.uuid4())
+            utterance_start_time = time.time()
+            speech_end_time = utterance_start_time  # Approximate - actual is when VAD detected end
+            
+            from backend.services.metrics_service import get_metrics_service
+            metrics = get_metrics_service()
+            metrics.start_utterance(utterance_id)
+            
+            # STRUCTURED LOGGING: Log utterance start
+            logger.info(f"Streaming: [UTTERANCE] Start - id={utterance_id}, chunks={len(session.audio_chunks)}, "
+                       f"total_bytes={total_accumulated}, is_final={is_final}")
+            
+            chunk_text = None
             
             try:
-                print(f"Streaming: Calling STT with {len(accumulated_audio)} bytes of {audio_format} audio")
-                
-                # If chunk is too large, split it into smaller segments
-                if len(accumulated_audio) > MAX_CHUNK_SIZE_FOR_STT:
-                    print(f"Streaming: WARNING - Chunk too large ({len(accumulated_audio)} bytes), splitting into segments")
-                    # Split into 500KB segments (≈30 seconds each)
-                    segment_size = 500000
-                    segments = [accumulated_audio[i:i+segment_size] for i in range(0, len(accumulated_audio), segment_size)]
-                    print(f"Streaming: Split into {len(segments)} segments")
+                if session.audio_chunks:
+                    # DEMO MODE: When is_final=True, frontend sends a complete utterance
+                    # The frontend creates a Blob from accumulated chunks and sends it
+                    # The session.audio_chunks contains the chunks that were sent
+                    # For demo reliability, process all chunks and let merging logic handle it
+                    all_chunks = session.audio_chunks  # Use all chunks in order
+                    total_size = sum(len(c) for c in all_chunks)
+                    logger.info(f"Streaming: DEMO MODE - Processing final utterance ({len(all_chunks)} chunks, {total_size} bytes, {total_size/1024:.1f}KB, is_final={is_final})")
                     
-                    # Process first segment only (most recent audio)
-                    chunk_text = svcs['stt'].transcribe_audio(
-                        segments[-1],  # Use last segment (most recent)
-                        language_code=language_code,
-                        audio_format=audio_format
-                    )
-                else:
-                    chunk_text = svcs['stt'].transcribe_audio(
-                        accumulated_audio,
-                        language_code=language_code,
-                        audio_format=audio_format
-                    )
+                    logger.info(f"Streaming: Processing complete utterance ({len(all_chunks)} chunks, {total_size} bytes, {total_size/1024:.1f}KB)")
+                    
+                    # PRIORITY FIX #2: Convert WebM to WAV before STT processing
+                    # Never send raw WebM chunks to STT - always convert to WAV first
+                    from backend.services.audio_converter import convert_webm_to_wav, validate_audio
+                    
+                    # Merge all chunks into single audio blob
+                    # CRITICAL: WebM chunks can't just be concatenated - they need proper merging
+                    # Try pydub first (proper merging), fallback to simple join if pydub fails
+                    merged_webm = None
+                    try:
+                        from pydub import AudioSegment
+                        import io
+                        
+                        # Properly merge WebM chunks using pydub
+                        audio_segments = []
+                        for chunk_data in all_chunks:
+                            if len(chunk_data) < 100:  # Skip very small chunks
+                                continue
+                            try:
+                                chunk_audio = AudioSegment.from_file(io.BytesIO(chunk_data), format="webm")
+                                audio_segments.append(chunk_audio)
+                            except Exception as e:
+                                logger.debug(f"Streaming: Failed to load chunk for merging: {e}")
+                                continue
+                        
+                        if audio_segments:
+                            # Concatenate all segments properly
+                            merged_audio = sum(audio_segments)
+                            # Convert to mono and 16kHz for STT
+                            merged_audio = merged_audio.set_channels(1)
+                            merged_audio = merged_audio.set_frame_rate(16000)
+                            merged_audio = merged_audio.set_sample_width(2)  # 16-bit
+                            
+                            # Export as WAV (pydub can do this without ffmpeg for WAV)
+                            wav_output = io.BytesIO()
+                            merged_audio.export(wav_output, format="wav")
+                            wav_data = wav_output.getvalue()
+                            
+                            # Use WAV directly (skip WebM conversion step)
+                            logger.info(f"Streaming: Properly merged {len(audio_segments)} WebM chunks using pydub, converted to WAV ({len(wav_data)} bytes)")
+                            # Set wav_audio directly and skip conversion
+                            wav_audio = wav_data
+                            conversion_time = 0  # Already converted
+                            merged_webm = None  # Not needed since we have WAV
+                        else:
+                            # Fallback to simple join if pydub merging fails
+                            merged_webm = b''.join(all_chunks)
+                            logger.warning(f"Streaming: pydub merging failed, using simple join ({len(merged_webm)} bytes)")
+                            wav_audio = None
+                    except Exception as e:
+                        # If pydub not available or fails, try processing chunks individually
+                        logger.warning(f"Streaming: pydub not available for WebM merging: {e}")
+                        
+                        # DEMO MODE FIX: For demo reliability, use single-chunk approach
+                        # When frontend sends a Blob created from multiple chunks, it's already concatenated
+                        # Try to use it directly - Groq STT can sometimes handle concatenated WebM
+                        # If that fails, fall back to largest chunk
+                        if len(all_chunks) == 1:
+                            # Single chunk - use it directly (best case)
+                            merged_webm = all_chunks[0]
+                            logger.info(f"Streaming: Using single WebM chunk ({len(merged_webm)} bytes)")
+                            wav_audio = None
+                        else:
+                            # Multiple chunks - frontend sent a Blob which is already concatenated
+                            # CRITICAL: WebM chunks cannot be simply concatenated - they need proper merging
+                            # The frontend's Blob() constructor just concatenates bytes, creating invalid WebM
+                            # Solution: Use the largest single chunk (most likely to be valid)
+                            try:
+                                # Find the largest chunk (most likely to contain complete audio data)
+                                largest_chunk = max(all_chunks, key=len)
+                                total_size = sum(len(c) for c in all_chunks)
+                                
+                                if len(largest_chunk) > 1000:  # At least 1KB
+                                    # Validate the largest chunk has valid WebM header
+                                    if len(largest_chunk) >= 4 and largest_chunk[:4] == b'\x1a\x45\xdf\xa3':
+                                        merged_webm = largest_chunk
+                                        logger.info(f"Streaming: Using largest valid WebM chunk ({len(merged_webm)} bytes from {len(all_chunks)} chunks, total: {total_size} bytes)")
+                                        wav_audio = None
+                                    else:
+                                        # Largest chunk also invalid - try concatenated version as last resort
+                                        concatenated = b''.join(all_chunks)
+                                        if len(concatenated) >= 4 and concatenated[:4] == b'\x1a\x45\xdf\xa3':
+                                            merged_webm = concatenated
+                                            logger.warning(f"Streaming: Largest chunk invalid, trying concatenated version ({len(merged_webm)} bytes)")
+                                            wav_audio = None
+                                        else:
+                                            # Both invalid - use largest anyway (might work with STT)
+                                            merged_webm = largest_chunk
+                                            logger.warning(f"Streaming: Both chunks invalid, using largest anyway ({len(merged_webm)} bytes) - STT may fail")
+                                            wav_audio = None
+                                else:
+                                    logger.error(f"Streaming: All chunks too small (largest: {len(largest_chunk)} bytes)")
+                                    merged_webm = None
+                                    wav_audio = None
+                            except Exception as merge_error:
+                                # Fallback: use first chunk if available
+                                if all_chunks and len(all_chunks[0]) > 1000:
+                                    merged_webm = all_chunks[0]
+                                    logger.warning(f"Streaming: Merge failed, using first chunk ({len(merged_webm)} bytes): {merge_error}")
+                                    wav_audio = None
+                                else:
+                                    logger.error(f"Streaming: All merge attempts failed: {merge_error}")
+                                    merged_webm = None
+                                    wav_audio = None
+                    
+                    # If we don't have WAV from pydub, try converting WebM to WAV
+                    if wav_audio is None:
+                        if not merged_webm or len(merged_webm) < 100:
+                            logger.error(f"Streaming: [UTTERANCE] {utterance_id} - Failed to merge audio chunks")
+                            metrics.record_error('merge_fail')
+                            chunk_text = None
+                            merged_text = ""
+                            is_noise = True
+                            should_process = False
+                        else:
+                            # Convert WebM to WAV (16kHz mono)
+                            conversion_start = time.time()
+                            logger.info(f"Streaming: Converting WebM to WAV ({len(merged_webm)} bytes)")
+                            wav_audio = convert_webm_to_wav(merged_webm, target_sample_rate=16000, target_channels=1)
+                            conversion_time = (time.time() - conversion_start) * 1000
+                    
+                    # If conversion fails, try using WebM directly (STT services can handle WebM)
+                    use_webm_directly = False
+                    if not wav_audio:
+                        logger.warning(f"Streaming: [UTTERANCE] {utterance_id} - WebM to WAV conversion failed, trying WebM directly")
+                        # CRITICAL: Validate WebM before using directly
+                        # Simple concatenation creates invalid WebM files that STT can't process
+                        if merged_webm and len(merged_webm) > 1000:  # At least 1KB
+                            # Validate WebM header (EBML header: 0x1A 0x45 0xDF 0xA3)
+                            if len(merged_webm) >= 4 and merged_webm[:4] == b'\x1a\x45\xdf\xa3':
+                                use_webm_directly = True
+                                logger.info(f"Streaming: [UTTERANCE] {utterance_id} - Using WebM directly for STT (size: {len(merged_webm)} bytes, valid header)")
+                            else:
+                                # Invalid WebM header - but try STT anyway (some services are lenient)
+                                logger.warning(f"Streaming: [UTTERANCE] {utterance_id} - Invalid WebM header (Header: {merged_webm[:4].hex() if merged_webm else 'none'}), but trying STT anyway")
+                                # Attempt STT with invalid WebM - some services might still work
+                                use_webm_directly = True
+                                logger.info(f"Streaming: [UTTERANCE] {utterance_id} - Attempting STT with potentially invalid WebM (size: {len(merged_webm)} bytes)")
+                        else:
+                            logger.error(f"Streaming: [UTTERANCE] {utterance_id} - Audio too small or invalid ({len(merged_webm) if merged_webm else 0} bytes)")
+                            metrics.record_error('conversion_fail')
+                            chunk_text = None
+                            merged_text = ""
+                            is_noise = True
+                            should_process = False
+                    
+                    if wav_audio or use_webm_directly:
+                        # PRIORITY FIX #6: Validate audio before STT
+                        validation_start = time.time()
+                        if wav_audio:
+                            is_valid, audio_metadata = validate_audio(wav_audio, audio_format='wav')
+                        else:
+                            # For WebM, do basic validation (size check)
+                            is_valid = len(merged_webm) > 1000
+                            audio_metadata = {'file_size': len(merged_webm), 'format': 'webm'} if merged_webm else None
+                        validation_time = (time.time() - validation_start) * 1000
+                        
+                        # METRICS: Record validation
+                        metrics.record_validation(is_valid)
+                        
+                        # STRUCTURED LOGGING: Log audio metadata
+                        if audio_metadata:
+                            logger.info(f"Streaming: [UTTERANCE] {utterance_id} - Audio metadata: "
+                                       f"sample_rate={audio_metadata.get('sample_rate', 'unknown')}, "
+                                       f"channels={audio_metadata.get('channels', 'unknown')}, "
+                                       f"duration_ms={audio_metadata.get('duration_ms', 'unknown')}, "
+                                       f"file_size={audio_metadata.get('file_size', 'unknown')}, "
+                                       f"valid={is_valid}, conversion_time_ms={conversion_time:.1f}, "
+                                       f"validation_time_ms={validation_time:.1f}")
+                        
+                        # FAILURE HANDLING RULE #1: If validation fails, attempt reconversion once
+                        if not is_valid:
+                            logger.warning(f"Streaming: [UTTERANCE] {utterance_id} - Audio validation failed, attempting reconversion")
+                            # Attempt reconversion once
+                            wav_audio = convert_webm_to_wav(merged_webm, target_sample_rate=16000, target_channels=1)
+                            if wav_audio:
+                                is_valid, audio_metadata = validate_audio(wav_audio, audio_format='wav')
+                                metrics.record_validation(is_valid)
+                                if not is_valid:
+                                    logger.error(f"Streaming: [UTTERANCE] {utterance_id} - Validation failed after reconversion")
+                                    metrics.record_error('validation_fail')
+                                    # Don't proceed - will return user-friendly message
+                                    chunk_text = None
+                            else:
+                                logger.error(f"Streaming: [UTTERANCE] {utterance_id} - Reconversion also failed")
+                                metrics.record_error('conversion_fail')
+                                chunk_text = None
+                        
+                        # DEMO MODE: Disable retry logic for reliability (single attempt only)
+                        if wav_audio or use_webm_directly:  # Only proceed if we have valid audio
+                            chunk_text = None
+                            max_retries = 0  # DEMO: No retries (single attempt only)
+                            stt_start_time = time.time()
+                            
+                            # FAILURE HANDLING RULE #4: STT latency timeout (8 seconds)
+                            STT_TIMEOUT_MS = 8000
+                            
+                            # Determine which audio to use
+                            audio_for_stt = wav_audio if wav_audio else merged_webm
+                            audio_format_for_stt = 'wav' if wav_audio else 'webm'
+                            
+                            for retry_attempt in range(max_retries + 1):
+                                try:
+                                    attempt_start = time.time()
+                                    logger.info(f"Streaming: [UTTERANCE] {utterance_id} - STT attempt {retry_attempt + 1}/{max_retries + 1} (format: {audio_format_for_stt})")
+                                    
+                                    # Check if we've exceeded timeout
+                                    elapsed_ms = (time.time() - stt_start_time) * 1000
+                                    if elapsed_ms > STT_TIMEOUT_MS:
+                                        logger.error(f"Streaming: [UTTERANCE] {utterance_id} - STT timeout ({elapsed_ms:.0f}ms > {STT_TIMEOUT_MS}ms)")
+                                        metrics.record_error('stt_timeout')
+                                        break
+                                    
+                                    chunk_text = svcs['stt'].transcribe_audio(
+                                        audio_for_stt,
+                                        language_code=language_code,
+                                        audio_format=audio_format_for_stt
+                                    )
+                                    
+                                    attempt_latency = (time.time() - attempt_start) * 1000
+                                    metrics.record_stt_latency(attempt_latency)
+                                    
+                                    if chunk_text and chunk_text.strip():
+                                        logger.info(f"Streaming: [UTTERANCE] {utterance_id} - STT succeeded on attempt {retry_attempt + 1} "
+                                                   f"({attempt_latency:.1f}ms): '{chunk_text[:50]}...'")
+                                        metrics.record_transcription_success(True)
+                                        break
+                                    else:
+                                        logger.warning(f"Streaming: [UTTERANCE] {utterance_id} - STT attempt {retry_attempt + 1} returned empty")
+                                        if retry_attempt < max_retries:
+                                            metrics.record_stt_retry()
+                                        
+                                except Exception as e:
+                                    attempt_latency = (time.time() - attempt_start) * 1000
+                                    logger.warning(f"Streaming: [UTTERANCE] {utterance_id} - STT attempt {retry_attempt + 1} failed ({attempt_latency:.1f}ms): {e}")
+                                    metrics.record_error('stt_error')
+                                    if retry_attempt < max_retries:
+                                        metrics.record_stt_retry()
+                                    
+                                # Retry strategy: On failure, try re-converting or splitting
+                                if retry_attempt < max_retries and not chunk_text:
+                                    if retry_attempt == 0:
+                                        # First retry: Re-convert audio (may fix corruption) or try WebM directly
+                                        if use_webm_directly:
+                                            # Already using WebM directly, try WAV conversion instead
+                                            logger.info(f"Streaming: [UTTERANCE] {utterance_id} - Retry 1: trying WAV conversion")
+                                            wav_audio = convert_webm_to_wav(merged_webm, target_sample_rate=16000, target_channels=1)
+                                            if wav_audio:
+                                                audio_for_stt = wav_audio
+                                                audio_format_for_stt = 'wav'
+                                                use_webm_directly = False
+                                            else:
+                                                logger.warning(f"Streaming: [UTTERANCE] {utterance_id} - WAV conversion still failed, keeping WebM")
+                                        else:
+                                            # Try re-converting
+                                            logger.info(f"Streaming: [UTTERANCE] {utterance_id} - Retry 1: re-converting audio")
+                                            wav_audio = convert_webm_to_wav(merged_webm, target_sample_rate=16000, target_channels=1)
+                                            if wav_audio:
+                                                audio_for_stt = wav_audio
+                                                audio_format_for_stt = 'wav'
+                                            else:
+                                                # Conversion failed, try WebM directly
+                                                logger.info(f"Streaming: [UTTERANCE] {utterance_id} - Re-conversion failed, trying WebM directly")
+                                                audio_for_stt = merged_webm
+                                                audio_format_for_stt = 'webm'
+                                                use_webm_directly = True
+                                    elif retry_attempt == 1:
+                                        # Second retry: Split into smaller segments
+                                        logger.info(f"Streaming: [UTTERANCE] {utterance_id} - Retry 2: splitting into smaller segments")
+                                        # TODO: Implement segment splitting for retry
+                                        metrics.record_error('stt_empty_after_retries')
+                                        break
+                            
+                            if not chunk_text:
+                                logger.error(f"Streaming: [UTTERANCE] {utterance_id} - All STT attempts failed")
+                                metrics.record_transcription_success(False)
+                                metrics.record_error('stt_empty')
+                    
+                    # PRIORITY FIX #1: Old parallel chunk processing removed
+                    # We now process complete utterances as single WAV files (converted from WebM)
+                    # This eliminates per-chunk STT calls and format issues
+                    
+                    # Fallback: If primary WebM→WAV conversion/STT failed, try pydub merging approach
+                    if not chunk_text and len(session.audio_chunks) > 1:
+                        logger.info("Streaming: Primary WebM→WAV conversion failed, trying pydub fallback")
+                        logger.debug("Streaming: Individual chunks failed, trying merged audio as fallback")
+                        
+                        # Try to properly merge WebM chunks using pydub (creates valid WebM file)
+                        accumulated_audio = None
+                        try:
+                            # Import pydub for proper audio merging
+                            try:
+                                from pydub import AudioSegment
+                                import io
+                                
+                                # Convert each chunk to AudioSegment and concatenate properly
+                                audio_segments = []
+                                # Use all chunks, not just last 5, to maximize chances
+                                chunks_to_merge = session.audio_chunks
+                                
+                                for chunk_idx, chunk_data in enumerate(chunks_to_merge):
+                                    if len(chunk_data) < 100:  # Skip very small chunks
+                                        continue
+                                    try:
+                                        # Load WebM chunk as AudioSegment
+                                        chunk_audio = AudioSegment.from_file(io.BytesIO(chunk_data), format="webm")
+                                        audio_segments.append(chunk_audio)
+                                        logger.debug(f"Streaming: Loaded chunk {chunk_idx+1} for merging ({len(chunk_data)} bytes, {len(chunk_audio)}ms)")
+                                    except Exception as e:
+                                        logger.debug(f"Streaming: Failed to load chunk {chunk_idx+1} for merging: {e}")
+                                        continue
+                                
+                                if audio_segments:
+                                    # Concatenate all segments properly
+                                    merged_audio = sum(audio_segments)
+                                    total_duration_ms = len(merged_audio)
+                                    logger.debug(f"Streaming: Merged {len(audio_segments)} chunks into {total_duration_ms}ms audio")
+                                    
+                                    # For large audio, split into smaller segments before exporting
+                                    # Large WebM files can cause issues - split if > 20 seconds (reduced from 30s for better reliability)
+                                    MAX_SEGMENT_DURATION_MS = 10000  # 10 seconds (reduced for better STT reliability and faster response)
+                                    if total_duration_ms > MAX_SEGMENT_DURATION_MS:
+                                        logger.info(f"Streaming: [LARGE_AUDIO] Large audio ({total_duration_ms}ms, {total_duration_ms/1000:.1f}s), splitting into segments")
+                                        # Split into segments and try each (process in parallel for speed)
+                                        num_segments = (total_duration_ms // MAX_SEGMENT_DURATION_MS) + 1
+                                        segment_duration = total_duration_ms // num_segments
+                                        
+                                        logger.info(f"Streaming: [LARGE_AUDIO] Splitting into {num_segments} segments of ~{segment_duration}ms each")
+                                        
+                                        # Process segments in parallel for faster transcription
+                                        segment_texts = []
+                                        segment_start_time = time.time()
+                                        
+                                        def transcribe_segment(seg_idx, start_ms, end_ms):
+                                            """Transcribe a single segment"""
+                                            try:
+                                                segment = merged_audio[start_ms:end_ms]
+                                                wav_output = io.BytesIO()
+                                                segment.export(wav_output, format="wav")
+                                                segment_audio = wav_output.getvalue()
+                                                
+                                                logger.info(f"Streaming: [LARGE_AUDIO] Processing segment {seg_idx+1}/{num_segments} ({len(segment_audio)} bytes, {len(segment)}ms)")
+                                                result = svcs['stt'].transcribe_audio(
+                                                    segment_audio,
+                                                    language_code=language_code,
+                                                    audio_format='wav'
+                                                )
+                                                if result and result.strip():
+                                                    logger.info(f"Streaming: [LARGE_AUDIO] Segment {seg_idx+1} transcribed: '{result.strip()}'")
+                                                    return (seg_idx, result.strip())
+                                                else:
+                                                    logger.debug(f"Streaming: [LARGE_AUDIO] Segment {seg_idx+1} returned empty")
+                                                    return (seg_idx, None)
+                                            except Exception as e:
+                                                logger.warning(f"Streaming: [LARGE_AUDIO] Segment {seg_idx+1} transcription failed: {e}")
+                                                return (seg_idx, None)
+                                        
+                                        # Process segments in parallel (max 4 at a time to avoid overwhelming STT)
+                                        with ThreadPoolExecutor(max_workers=min(4, num_segments)) as segment_executor:
+                                            futures = {
+                                                segment_executor.submit(transcribe_segment, seg_idx, 
+                                                    seg_idx * segment_duration, 
+                                                    min((seg_idx + 1) * segment_duration, total_duration_ms)): seg_idx
+                                                for seg_idx in range(num_segments)
+                                            }
+                                            
+                                            # Collect results in order
+                                            segment_results = {}
+                                            for future in as_completed(futures):
+                                                seg_idx, text = future.result()
+                                                if text:
+                                                    segment_results[seg_idx] = text
+                                            
+                                            # Merge segments in order
+                                            for seg_idx in sorted(segment_results.keys()):
+                                                if not chunk_text:
+                                                    chunk_text = segment_results[seg_idx]
+                                                else:
+                                                    chunk_text += " " + segment_results[seg_idx]
+                                        
+                                        segment_elapsed = time.time() - segment_start_time
+                                        if chunk_text:
+                                            logger.info(f"Streaming: [LARGE_AUDIO] Successfully transcribed large audio in {num_segments} segments ({segment_elapsed:.3f}s): '{chunk_text}'")
+                                        else:
+                                            logger.warning(f"Streaming: [LARGE_AUDIO] Failed to transcribe any segments from large audio ({num_segments} segments, {segment_elapsed:.3f}s)")
+                                    else:
+                                        # Small enough - export as WAV directly (more reliable than WebM)
+                                        wav_output = io.BytesIO()
+                                        merged_audio.export(wav_output, format="wav")
+                                        accumulated_audio = wav_output.getvalue()
+                                        logger.debug(f"Streaming: Exported merged audio as WAV ({len(accumulated_audio)} bytes)")
+                                        
+                                        # Try transcription with WAV
+                                        try:
+                                            chunk_text = svcs['stt'].transcribe_audio(
+                                                accumulated_audio,
+                                                language_code=language_code,
+                                                audio_format='wav'
+                                            )
+                                            if chunk_text and chunk_text.strip():
+                                                logger.info(f"Streaming: Successfully transcribed merged audio (WAV): '{chunk_text.strip()}'")
+                                        except Exception as e:
+                                            logger.debug(f"Streaming: Merged WAV transcription failed: {e}")
+                                            chunk_text = None
+                                    
+                            except ImportError:
+                                logger.debug("Streaming: pydub not available, cannot merge chunks properly")
+                                accumulated_audio = None
+                            except Exception as e:
+                                logger.debug(f"Streaming: Failed to merge chunks with pydub: {e}")
+                                accumulated_audio = None
+                        except Exception as e:
+                            logger.debug(f"Streaming: Error preparing merged audio: {e}")
+                            accumulated_audio = None
                 
                 if chunk_text and chunk_text.strip():
                     chunk_text = chunk_text.strip()
-                    print(f"Streaming: STT transcribed successfully: '{chunk_text}' (length: {len(chunk_text)} chars)")
+                    
+                    # Filter out transcription artifacts and noise
+                    # Remove very short transcriptions that are likely noise
+                    if len(chunk_text) < 2:
+                        logger.debug(f"Streaming: STT returned very short text '{chunk_text}' - treating as noise")
+                        chunk_text = None
+                    # Filter out common transcription artifacts - only reject exact matches
+                    # Don't reject common words like "hello" that are legitimate speech
+                    elif chunk_text.lower() in ['transcribe accurately', 'transcriber\'s name', 'transcriber name']:
+                        logger.warning(f"Streaming: STT returned transcription artifact '{chunk_text}' - rejecting")
+                        chunk_text = None
+                    else:
+                        logger.info(f"Streaming: STT transcribed successfully: '{chunk_text}' (length: {len(chunk_text)} chars)")
                     # Add transcribed text to session (will prevent duplicates)
                     session.add_text_chunk(chunk_text)
                 else:
-                    print(f"Streaming: STT returned empty/None (likely noise/silence or STT error)")
-                    print(f"Streaming: Check STT service logs above for details")
+                    logger.debug(f"Streaming: STT returned empty/None (likely noise/silence or STT error)")
                     chunk_text = None
                 
-                # CRITICAL: Clear accumulated chunks after processing to prevent memory buildup and invalid WebM files
-                chunks_cleared = len(session.audio_chunks)
-                session.audio_chunks.clear()
-                print(f"Streaming: Cleared {chunks_cleared} accumulated audio chunks after processing")
+                # CRITICAL: Only clear chunks if transcription succeeded
+                # If transcription failed, keep chunks for retry with different approach
+                if chunk_text and chunk_text.strip():
+                    chunks_cleared = len(session.audio_chunks)
+                    chunks_size_before = sum(len(c) for c in session.audio_chunks)
+                    session.audio_chunks.clear()
+                    
+                    # STRUCTURED LOGGING: Log chunk clearing
+                    logger.info(f"Streaming: [UTTERANCE] {utterance_id} - Cleared {chunks_cleared} chunks "
+                               f"({chunks_size_before} bytes) after successful transcription")
+                    
+                    # METRICS: Log utterance completion
+                    utterance_duration = (time.time() - utterance_start_time) * 1000
+                    logger.info(f"Streaming: [UTTERANCE] {utterance_id} - Complete: duration={utterance_duration:.1f}ms, "
+                               f"transcript_length={len(chunk_text)}, success=true")
+                else:
+                    # STRUCTURED LOGGING: Log failure
+                    utterance_duration = (time.time() - utterance_start_time) * 1000
+                    logger.error(f"Streaming: [UTTERANCE] {utterance_id} - Failed: duration={utterance_duration:.1f}ms, "
+                                f"reason=no_transcription")
+                    # Keep chunks for retry - don't clear on failure
+                    logger.debug(f"Streaming: Keeping {len(session.audio_chunks)} chunks for retry (transcription failed)")
             except Exception as e:
-                print(f"Streaming: STT error: {e}")
-                import traceback
-                traceback.print_exc()
+                logger.error(f"Streaming: STT error: {e}", exc_info=True)
                 chunk_text = None
-                # Clear chunks even on error to prevent accumulation
-                session.audio_chunks.clear()
-                print(f"Streaming: Cleared accumulated chunks after error")
+                # Don't clear chunks on error - keep them for retry
+                logger.debug(f"Streaming: Keeping {len(session.audio_chunks)} chunks after error (will retry)")
+            finally:
+                # Always reset processing flag
+                session.is_processing = False
         else:
             # Not enough audio yet, wait for more chunks
             if total_accumulated > 0:
                 print(f"Streaming: Accumulating audio (current: {total_accumulated} bytes, need: {MIN_CHUNK_SIZE_FOR_STT} bytes, max: {MAX_CHUNK_SIZE_FOR_STT} bytes)")
         
         # Check if chunk is noise (empty or very short)
+        # CRITICAL FIX: Better noise detection - check multiple factors
         is_noise = False
         should_process = False
         merged_text = ""
         
+        # Determine if this is noise based on:
+        # 1. No transcription (STT returned empty/None)
+        # 2. Very short transcription (< 2 chars) - likely noise artifacts
+        # 3. Audio size vs transcription length (very large audio with tiny text = likely noise)
+        audio_size = sum(len(c) for c in session.audio_chunks)
+        estimated_duration_ms = (audio_size / 8000) * 1000  # ~8KB per second for WebM/Opus
+        
         if not chunk_text or len(chunk_text.strip()) < 2:
-            # This chunk is noise
+            # No transcription or very short - likely noise
             is_noise = True
-            print(f"Streaming: Accumulated audio is noise (no text detected, {len(session.audio_chunks)} chunks)")
+            logger.warning(f"Streaming: No transcription obtained - audio may be too short, corrupted, or STT failed. "
+                          f"Chunks: {len(session.audio_chunks)}, Total size: {audio_size} bytes, "
+                          f"Estimated duration: {estimated_duration_ms:.0f}ms")
+            logger.debug(f"Streaming: Accumulated audio is noise (no text detected, {len(session.audio_chunks)} chunks)")
+        elif len(chunk_text.strip()) < 3 and estimated_duration_ms > 2000:
+            # Very short transcription (< 3 chars) but long audio (> 2 seconds) = likely noise
+            is_noise = True
+            logger.warning(f"Streaming: Suspicious transcription - very short text '{chunk_text}' for long audio "
+                          f"({estimated_duration_ms:.0f}ms) - treating as noise")
+            chunk_text = None  # Clear the suspicious transcription
             
             # If we have previous text chunks, merge and trigger processing
             merged_text = session.get_merged_text()
             if merged_text and len(merged_text.strip()) >= 2:
                 should_process = True
-                print(f"Streaming: Noise detected, merging {len(session.text_chunks)} text chunks: '{merged_text}'")
+                logger.info(f"Streaming: Noise detected, merging {len(session.text_chunks)} text chunks: '{merged_text[:50]}...'")
             
-            # Clear accumulated audio chunks if we processed them (to prevent memory buildup)
-            if total_accumulated >= MIN_CHUNK_SIZE_FOR_STT or is_final:
+            # Only clear accumulated audio chunks if we successfully processed them
+            # If transcription failed, keep chunks for retry
+            if chunk_text and chunk_text.strip():
+                chunks_cleared = len(session.audio_chunks)
                 session.audio_chunks = []  # Clear processed chunks
+                logger.info(f"Streaming: Cleared {chunks_cleared} chunks after successful transcription")
+            else:
+                # Transcription failed - keep chunks for potential retry
+                logger.debug(f"Streaming: Keeping {len(session.audio_chunks)} chunks (transcription failed, may retry with next chunk)")
         else:
             # Chunk has text - it was already added to session in the try block above
             chunk_text = chunk_text.strip()
-            print(f"Streaming: Accumulated audio transcribed: '{chunk_text}' (already added to session)")
+            logger.debug(f"Streaming: Accumulated audio transcribed: '{chunk_text[:50]}...' (already added to session)")
             
             # Clear accumulated audio chunks after successful transcription
             session.audio_chunks = []  # Clear processed chunks
@@ -601,27 +1228,65 @@ def process_stream_chunk():
             merged_text = session.get_merged_text()
             if merged_text and len(merged_text.strip()) >= 2:
                 should_process = True
-                print(f"Streaming: Final chunk, processing merged text: '{merged_text}'")
+                logger.info(f"Streaming: Final chunk, processing merged text: '{merged_text[:50]}...'")
             # Clear all accumulated chunks on final
             session.audio_chunks = []
         
-        return jsonify({
+        # Reset processing flag before returning
+        session.is_processing = False
+        
+        # FAILURE HANDLING RULE #2: If STT returns empty, provide user-friendly message
+        response_data = {
             "chunk_text": chunk_text or "",
             "is_noise": is_noise,
             "merged_text": merged_text,
             "should_process": should_process,
             "session_id": session_id,
             "conversation_id": session.conversation_id
-        }), 200
+        }
+        
+        # Add user-friendly error messages if transcription failed
+        if not chunk_text and is_final:
+            # Check error type from metrics
+            from backend.services.metrics_service import get_metrics_service
+            metrics = get_metrics_service()
+            error_counts = metrics.error_counts
+            
+            if error_counts.get('validation_fail', 0) > 0:
+                response_data["error_message"] = "I couldn't process the audio, please repeat."
+            elif error_counts.get('conversion_fail', 0) > 0:
+                response_data["error_message"] = "I couldn't process the audio, please repeat."
+            elif error_counts.get('stt_timeout', 0) > 0:
+                response_data["error_message"] = "Processing took too long. Please try again."
+            else:
+                response_data["error_message"] = "I couldn't quite hear that — would you like to repeat?"
+        
+        return jsonify(response_data), 200
         
     except Exception as e:
-        print(f"Error processing stream chunk: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error processing stream chunk: {e}", exc_info=True)
+        # Enhanced error recovery: return helpful error message
+        error_message = str(e)
+        if "timeout" in error_message.lower():
+            error_message = "Request timeout - audio processing took too long. Please try again."
+        elif "rate limit" in error_message.lower():
+            error_message = "Rate limit exceeded - too many requests. Please wait a moment."
+        elif "session" in error_message.lower():
+            error_message = "Session error - please restart the conversation."
+        else:
+            error_message = "Error processing audio chunk. Please try again."
+        
+        return jsonify({
+            "error": error_message,
+            "chunk_text": "",
+            "is_noise": False,
+            "should_process": False,
+            "session_id": session_id if 'session_id' in locals() else None
+        }), 500
 
 
 @app.route('/api/voice/stream/process', methods=['POST'])
+@limiter.limit("20 per minute")  # Limit LLM processing from streaming
 def process_streamed_text():
     """
     Process merged text from streaming session with LLM
@@ -673,6 +1338,7 @@ def process_streamed_text():
         
         # Generate LLM response
         print(f"Streaming LLM: Processing merged text: '{merged_text}'")
+        llm_start_time = time.time()  # Track LLM start time for metrics
         llm_result = svcs['llm'].generate_response(
             user_id=user_id,
             user_message=merged_text,
@@ -721,8 +1387,25 @@ def process_streamed_text():
                 import traceback
                 traceback.print_exc()
         
-        # Clear processed chunks from session
-        session.clear_text_chunks()
+        # METRICS: Calculate end-to-end latency (LLM start → TTS ready)
+        tts_ready_time = time.time()
+        end_to_end_latency = (tts_ready_time - llm_start_time) * 1000
+        
+        from backend.services.metrics_service import get_metrics_service
+        metrics = get_metrics_service()
+        metrics.record_end_to_end_latency(end_to_end_latency)
+        
+        logger.info(f"Streaming: [METRICS] End-to-end latency: {end_to_end_latency:.1f}ms (LLM+TTS processing)")
+        
+        logger.info(f"Streaming: [METRICS] End-to-end latency: {end_to_end_latency:.1f}ms (LLM+TTS processing)")
+        
+        # CRITICAL: Clear ALL accumulated chunks from session after TTS response is ready
+        # This prevents old chunks from accumulating and causing large file issues
+        # Discard unnecessary chunks after response is ready (as user suggested)
+        chunks_before_clear = len(session.audio_chunks)
+        total_size_before_clear = sum(len(c) for c in session.audio_chunks) if session.audio_chunks else 0
+        session.clear_text_chunks()  # This also clears audio_chunks
+        logger.info(f"Streaming: [CLEANUP] Cleared {chunks_before_clear} accumulated audio chunks ({total_size_before_clear/1024:.1f}KB) after TTS response ready")
         
         # Build response
         response_data = {
@@ -740,13 +1423,29 @@ def process_streamed_text():
         return jsonify(response_data), 200
         
     except Exception as e:
-        print(f"Error processing streamed text: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error processing streamed text: {e}", exc_info=True)
+        # Enhanced error recovery: return helpful error message
+        error_message = str(e)
+        if "timeout" in error_message.lower():
+            error_message = "Request timeout - processing took too long. Please try again."
+        elif "rate limit" in error_message.lower():
+            error_message = "Rate limit exceeded - too many requests. Please wait a moment."
+        elif "session" in error_message.lower() or "not found" in error_message.lower():
+            error_message = "Session expired or not found. Please restart the conversation."
+        elif "llm" in error_message.lower() or "model" in error_message.lower():
+            error_message = "AI service temporarily unavailable. Please try again in a moment."
+        else:
+            error_message = "Error processing request. Please try again."
+        
+        return jsonify({
+            "error": error_message,
+            "text_response": "",
+            "conversation_id": conversation_id if 'conversation_id' in locals() else None
+        }), 500
 
 
 @app.route('/api/text/process', methods=['POST'])
+@limiter.limit("30 per minute")  # Text processing is lighter, allow more requests
 def process_text():
     """
     Text processing endpoint

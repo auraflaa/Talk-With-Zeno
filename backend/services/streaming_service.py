@@ -38,6 +38,14 @@ class StreamingSession:
     def add_chunk(self, audio_data: bytes) -> None:
         """Add a new audio chunk to the session"""
         with self.lock:
+            # Prevent memory buildup: limit to 200 chunks
+            MAX_CHUNKS = 200
+            if len(self.audio_chunks) >= MAX_CHUNKS:
+                # Remove oldest chunks (keep most recent)
+                excess = len(self.audio_chunks) - MAX_CHUNKS + 1
+                self.audio_chunks = self.audio_chunks[excess:]
+                self.chunk_timestamps = self.chunk_timestamps[excess:]
+            
             self.audio_chunks.append(audio_data)
             self.chunk_timestamps.append(time.time())
             self.last_chunk_time = time.time()
@@ -51,6 +59,13 @@ class StreamingSession:
                 text_stripped = text.strip()
                 # Prevent duplicate consecutive chunks
                 if not self.text_chunks or self.text_chunks[-1] != text_stripped:
+                    # Prevent memory buildup: limit to 50 text chunks
+                    MAX_TEXT_CHUNKS = 50
+                    if len(self.text_chunks) >= MAX_TEXT_CHUNKS:
+                        # Remove oldest chunks (keep most recent)
+                        excess = len(self.text_chunks) - MAX_TEXT_CHUNKS + 1
+                        self.text_chunks = self.text_chunks[excess:]
+                    
                     self.text_chunks.append(text_stripped)
                     self.last_activity = datetime.now()
                 else:
@@ -141,6 +156,24 @@ class StreamingService:
                 del self.sessions[sid]
             if stale_ids:
                 print(f"StreamingService: Cleaned up {len(stale_ids)} stale sessions")
+    
+    def get_session_count(self) -> int:
+        """Get total number of active sessions"""
+        with self.lock:
+            return len(self.sessions)
+    
+    def reset_session(self, session_id: str) -> bool:
+        """Reset a session (clear all chunks) - useful for error recovery"""
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session:
+                session.clear_text_chunks()
+                session.audio_chunks = []
+                session.pending_chunks = []
+                session.is_processing = False
+                session.last_activity = datetime.now()
+                return True
+            return False
 
 
 # Global singleton instance

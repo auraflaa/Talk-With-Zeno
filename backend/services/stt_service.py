@@ -7,6 +7,7 @@ Supports chunk-wise processing for better accuracy
 
 import os
 import io
+import re
 from google.cloud import speech
 from google.oauth2 import service_account
 from typing import Optional, BinaryIO, List
@@ -29,9 +30,122 @@ class STTService:
         self.groq_api_key = os.getenv('GROQ_API_KEY') or os.getenv('VITE_GROQ_API_KEY')
         self.groq_client = None
         self.google_client = None
-        self.preferred_model = "whisper-large-v3-turbo"  # Faster option
-        self.fallback_model = "whisper-large-v3"  # More accurate option
+        # Prioritize accuracy over speed for better transcription quality
+        self.preferred_model = "whisper-large-v3"  # More accurate option (primary)
+        self.fallback_model = "whisper-large-v3-turbo"  # Faster fallback option
         self._initialize_clients()
+    
+    def _is_english_only(self, text: str) -> bool:
+        """
+        Check if text contains only English characters and common punctuation
+        
+        Args:
+            text: Text to check
+            
+        Returns:
+            True if text appears to be English-only, False otherwise
+        """
+        if not text or not text.strip():
+            return False
+        
+        # Remove common punctuation and whitespace
+        text_clean = re.sub(r'[^\w\s]', '', text)
+        text_clean = re.sub(r'\s+', '', text_clean)
+        
+        if not text_clean:
+            return False
+        
+        # Check for non-ASCII characters (non-English)
+        # Allow ASCII letters, numbers, and common punctuation
+        # Reject if contains characters outside ASCII printable range (32-126)
+        # or common extended ASCII (128-255) which includes accented characters
+        for char in text_clean:
+            code = ord(char)
+            # Allow ASCII letters and numbers (A-Z, a-z, 0-9)
+            if not (48 <= code <= 57 or 65 <= code <= 90 or 97 <= code <= 122):
+                # Found non-ASCII character - likely not English
+                return False
+        
+        # Additional check: look for common non-English character patterns
+        # Cyrillic, Chinese, Japanese, Korean, Arabic, etc.
+        non_english_patterns = [
+            r'[\u0400-\u04FF]',  # Cyrillic
+            r'[\u4E00-\u9FFF]',  # Chinese
+            r'[\u3040-\u309F\u30A0-\u30FF]',  # Japanese Hiragana/Katakana
+            r'[\uAC00-\uD7AF]',  # Korean
+            r'[\u0600-\u06FF]',  # Arabic
+            r'[\u0590-\u05FF]',  # Hebrew
+        ]
+        
+        for pattern in non_english_patterns:
+            if re.search(pattern, text):
+                return False
+        
+        return True
+    
+    def _validate_webm_audio(self, audio_data: bytes) -> bool:
+        """
+        Validate WebM audio data before sending to STT
+        
+        Args:
+            audio_data: Raw WebM audio bytes
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        if not audio_data or len(audio_data) < 100:
+            print("STT: WebM validation failed - too small or empty")
+            return False
+        
+        # Check minimum size (WebM files should be at least a few KB for valid audio)
+        if len(audio_data) < 2000:  # Increased minimum to 2KB for better validity
+            print(f"STT: WebM validation failed - too small ({len(audio_data)} bytes < 2000 bytes)")
+            return False
+        
+        # Check for WebM/EBML header signatures
+        # WebM files start with EBML header (0x1A45DFA3 in big-endian)
+        if len(audio_data) >= 4:
+            header = audio_data[:4]
+            # Check for all zeros or all same byte (likely corrupted)
+            if header == b'\x00' * 4 or (len(set(header)) == 1 and header[0] == 0):
+                print(f"STT: WebM validation failed - corrupted header (all zeros or same byte)")
+                return False  # Corrupted data
+            
+            # Check for EBML header (0x1A 0x45 0xDF 0xA3) - most common
+            if header == b'\x1a\x45\xdf\xa3':
+                # Additional validation: check for WebM-specific elements
+                # Look for 'webm' string or cluster markers in first 100 bytes
+                if len(audio_data) > 20:
+                    # Check for common WebM markers
+                    first_100 = audio_data[:100]
+                    if b'webm' in first_100.lower() or b'\x1f\x43\xb6\x75' in first_100:  # Cluster marker
+                        print(f"STT: WebM validation passed - valid EBML header and WebM markers ({len(audio_data)} bytes)")
+                        return True
+                print(f"STT: WebM validation passed - valid EBML header ({len(audio_data)} bytes)")
+                return True  # Valid EBML header
+            else:
+                # Invalid header - this is likely a concatenated WebM file (invalid)
+                print(f"STT: WebM validation failed - invalid header (expected EBML, got {header.hex()})")
+                return False
+        
+        # Reject if it's too large (likely corrupted or invalid)
+        if len(audio_data) > 10 * 1024 * 1024:  # 10MB max
+            print(f"STT: WebM validation failed - too large ({len(audio_data)} bytes > 10MB)")
+            return False
+        
+        # Additional check: ensure it's not all the same byte or very repetitive
+        if len(audio_data) > 1000:
+            sample = audio_data[:1000]
+            unique_count = len(set(sample))
+            if unique_count < 10:  # Less than 10 unique bytes - likely corrupted
+                return False
+            # Check entropy - valid audio should have reasonable entropy
+            if unique_count < len(sample) * 0.1:  # Less than 10% unique bytes
+                return False
+        
+        # If we can't definitively validate, be more strict
+        # Require at least EBML-like structure
+        return False  # Reject if we can't validate
     
     def _initialize_clients(self):
         """Initialize Groq and Google STT clients"""
@@ -148,16 +262,33 @@ class STTService:
                     
                     # Use Groq SDK for transcription
                     # Groq expects: file=(filename, file_content_bytes)
+                    # Use temperature=0 for most accurate transcription (deterministic)
                     transcription = self.groq_client.audio.transcriptions.create(
                         file=(f"audio.{file_extension}", audio_data),
                         model=model,
-                        temperature=0,
+                        temperature=0,  # Use 0 for most accurate transcription
                         language=lang,
-                        response_format="verbose_json",
+                        response_format="verbose_json"
+                        # Note: Removed prompt parameter - it was causing transcription issues
                     )
                     
                     if hasattr(transcription, 'text') and transcription.text:
                         text = transcription.text.strip()
+                        
+                        # Filter out transcription artifacts - only reject exact matches of known artifacts
+                        # Don't reject common words like "hello" that are legitimate speech
+                        text_lower = text.lower().strip()
+                        # Only reject if it's EXACTLY one of these artifacts (not if it contains them)
+                        exact_artifacts = ['transcribe accurately', 'transcriber\'s name', 'transcriber name']
+                        if text_lower in exact_artifacts:
+                            print(f"STT: Groq Whisper ({model}) returned transcription artifact: '{text}' - rejecting")
+                            continue  # Try next model or fallback
+                        
+                        # Filter: Only accept English transcriptions
+                        if not self._is_english_only(text):
+                            print(f"STT: Groq Whisper ({model}) transcription contains non-English text: '{text}' - rejecting")
+                            continue  # Try next model or fallback
+                        
                         print(f"STT: Groq Whisper ({model}) transcription successful: '{text}'")
                         return text
                     else:
@@ -166,8 +297,12 @@ class STTService:
                         
                 except Exception as e:
                     error_str = str(e).lower()
+                    # Don't retry if it's clearly an invalid file error - skip to next model faster
+                    if 'could not process file' in error_str or 'invalid media file' in error_str:
+                        print(f"STT: Groq Whisper ({model}) - invalid file, skipping: {str(e)[:100]}")
+                        continue  # Skip this model, try next
                     # Check for rate limit errors
-                    if 'rate limit' in error_str or '429' in error_str or 'quota' in error_str:
+                    elif 'rate limit' in error_str or '429' in error_str or 'quota' in error_str:
                         print(f"STT: Groq Whisper ({model}) rate limited: {e}")
                         # Try next model, then fallback to Google
                         continue
@@ -222,11 +357,11 @@ class STTService:
                 else:
                     print(f"STT: Could not detect WAV sample rate, using provided: {sample_rate} Hz")
             
-            # Try multiple encoding strategies for WebM/Opus
+            # Try fewer encoding strategies for WebM/Opus (reduced API calls)
             encoding_strategies = []
             
             if audio_format.lower() in ['webm', 'opus']:
-                # Strategy 1: Try WEBM_OPUS if available
+                # Strategy 1: Try WEBM_OPUS first (most common)
                 if hasattr(speech.RecognitionConfig.AudioEncoding, 'WEBM_OPUS'):
                     encoding_strategies.append({
                         'encoding': speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
@@ -234,15 +369,8 @@ class STTService:
                         'name': 'WEBM_OPUS'
                     })
                 
-                # Strategy 2: Try OGG_OPUS (similar format)
-                if hasattr(speech.RecognitionConfig.AudioEncoding, 'OGG_OPUS'):
-                    encoding_strategies.append({
-                        'encoding': speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
-                        'sample_rate': 48000,
-                        'name': 'OGG_OPUS'
-                    })
-                
-                # Strategy 3: Let Google auto-detect (most reliable)
+                # Strategy 2: Let Google auto-detect (most reliable fallback)
+                # Removed OGG_OPUS to reduce API calls - auto-detect is usually sufficient
                 encoding_strategies.append({
                     'encoding': speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED,
                     'sample_rate': 48000,
@@ -286,20 +414,29 @@ class STTService:
                         if response.results[0].alternatives and len(response.results[0].alternatives) > 0:
                             transcript = response.results[0].alternatives[0].transcript
                             confidence = response.results[0].alternatives[0].confidence if hasattr(response.results[0].alternatives[0], 'confidence') else None
+                            
+                            # Filter: Only accept English transcriptions
+                            if not self._is_english_only(transcript):
+                                print(f"STT: Google STT transcription contains non-English text: '{transcript}' - rejecting")
+                                continue  # Try next encoding strategy
+                            
                             print(f"STT: Transcription successful with {strategy['name']}: '{transcript}' (confidence: {confidence})")
                             return transcript.strip()
                     
                     print(f"STT: {strategy['name']} returned no results (response.results length: {len(response.results) if response.results else 0}), trying next strategy...")
                 except Exception as e:
                     error_str = str(e).lower()
-                    if 'invalid argument' in error_str or 'unsupported' in error_str:
-                        print(f"STT: {strategy['name']} not supported: {e}")
+                    # Skip retries for invalid file/encoding errors - they won't work
+                    if 'invalid argument' in error_str or 'unsupported' in error_str or 'bad encoding' in error_str:
+                        print(f"STT: {strategy['name']} - invalid file/encoding, skipping: {str(e)[:100]}")
+                        continue  # Try next strategy
+                    # For invalid media file errors from Groq, also skip quickly
+                    elif 'could not process file' in error_str or 'invalid media file' in error_str:
+                        print(f"STT: {strategy['name']} - invalid media file, skipping: {str(e)[:100]}")
                         continue  # Try next strategy
                     else:
                         # For other errors, log and try next
                         print(f"STT: Error with {strategy['name']}: {e}")
-                        import traceback
-                        traceback.print_exc()
                         continue
             
             print("STT: All encoding strategies failed - no transcription results")
@@ -314,16 +451,16 @@ class STTService:
                         audio_format: str = "webm") -> Optional[str]:
         """
         Transcribe audio data (public method)
-        Uses parallel processing with both Google STT and Groq Whisper simultaneously
-        to get the fastest result and reduce error chance. Returns first successful result.
+        Optimized: Tries Groq first (faster, more reliable), only uses Google as fallback.
+        This reduces API calls significantly since Groq usually succeeds.
         
         Args:
             audio_data: Raw audio bytes
-            language_code: Language code (default: en-US)
+            language_code: Language code (default: en-US) - FORCED to en-US for English-only
             audio_format: Audio format - 'webm' or 'wav' (default: webm)
             
         Returns:
-            Transcribed text or None if failed
+            Transcribed text (English-only) or None if failed
         """
         if not self.groq_client and not self.google_client:
             print("STT: No STT clients initialized")
@@ -333,86 +470,81 @@ class STTService:
             print(f"STT: Audio data too small ({len(audio_data)} bytes)")
             return None
         
-        # Use parallel processing: call both STT services simultaneously
-        # This prevents duplicates by ensuring only one result is returned
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import threading
+        # Force English-only: Override language_code to ensure English transcription
+        language_code = "en-US"
         
-        results = {}
-        errors = {}
-        lock = threading.Lock()
+        # Validate WebM audio before processing
+        # For large audio files (>100KB), validation might be too strict - try anyway
+        # STT services can often handle slightly invalid WebM files
+        if audio_format.lower() == "webm":
+            if len(audio_data) < 100 * 1024:  # Only validate smaller files strictly
+                if not self._validate_webm_audio(audio_data):
+                    print(f"STT: Invalid WebM audio data ({len(audio_data)} bytes) - skipping")
+                    return None
+            else:
+                # For large files, do a basic check but don't reject
+                if len(audio_data) < 1000:  # Still reject very small files
+                    print(f"STT: Audio data too small ({len(audio_data)} bytes)")
+                    return None
+                # For large files, try STT even if validation is uncertain
+                if not self._validate_webm_audio(audio_data):
+                    print(f"STT: WebM validation uncertain for large file ({len(audio_data)} bytes) - attempting transcription anyway")
         
-        def transcribe_google():
-            """Transcribe using Google STT"""
-            if not self.google_client:
-                return None
-            try:
-                # Detect sample rate for WAV files
-                sample_rate = 16000  # Default
-                if audio_format.lower() == 'wav':
-                    detected_rate = self._detect_wav_sample_rate(audio_data)
-                    if detected_rate:
-                        sample_rate = detected_rate
-                
-                result = self._transcribe_with_google(
-                    audio_data,
-                    language_code=language_code,
-                    sample_rate=sample_rate,
-                    audio_format=audio_format
-                )
-                if result and result.strip():
-                    with lock:
-                        results['google'] = result.strip()
-                    return result.strip()
-            except Exception as e:
-                with lock:
-                    errors['google'] = str(e)
-                return None
+        # Groq-first approach: Try Groq as primary, Google as fallback only on rate limiting
+        # This reduces API calls and server load significantly
         
-        def transcribe_groq():
-            """Transcribe using Groq Whisper"""
-            if not self.groq_client:
-                return None
+        # Try Groq first (primary provider)
+        if self.groq_client:
             try:
                 result = self._transcribe_with_groq(audio_data, language_code)
                 if result and result.strip():
-                    with lock:
-                        results['groq'] = result.strip()
-                    return result.strip()
-            except Exception as e:
-                with lock:
-                    errors['groq'] = str(e)
-                return None
-        
-        # Run both STT services in parallel
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {}
-            
-            if self.google_client:
-                futures['google'] = executor.submit(transcribe_google)
-            if self.groq_client:
-                futures['groq'] = executor.submit(transcribe_groq)
-            
-            # Wait for first successful result (prevents duplicates)
-            for future in as_completed(futures.values()):
-                provider = [k for k, v in futures.items() if v == future][0]
-                try:
-                    result = future.result()
-                    if result and result.strip():
-                        # Cancel other futures to prevent duplicate processing
-                        for other_provider, other_future in futures.items():
-                            if other_provider != provider:
-                                other_future.cancel()
-                        print(f"STT: {provider.capitalize()} transcription succeeded (parallel): '{result[:50]}...'")
+                    # Additional English-only check (defense in depth)
+                    if self._is_english_only(result):
+                        print(f"STT: Groq transcription succeeded (primary): '{result[:50]}...'")
                         return result.strip()
-                except Exception as e:
-                    print(f"STT: {provider.capitalize()} transcription exception: {e}")
+                    else:
+                        print(f"STT: Groq result filtered (non-English): '{result[:50]}...'")
+            except Exception as e:
+                error_str = str(e).lower()
+                # Check if it's a rate limit error - only then use Google fallback
+                is_rate_limit = 'rate limit' in error_str or '429' in error_str or 'quota' in error_str
+                if is_rate_limit:
+                    print(f"STT: Groq rate limited, falling back to Google: {e}")
+                else:
+                    print(f"STT: Groq transcription error (not rate limit): {e}")
+                    # If it's not a rate limit, don't try Google (likely invalid audio or other error)
+                    return None
         
-        # If we get here, both failed
-        if errors:
-            print(f"STT: All transcription methods failed. Errors: {errors}")
-        else:
-            print("STT: All transcription methods returned empty/None")
+        # Fallback to Google only if Groq was rate limited or unavailable
+        if self.google_client:
+            # Only use Google if Groq failed due to rate limiting or Groq is unavailable
+            if not self.groq_client or (self.groq_client and 'rate limit' in str(e).lower() if 'e' in locals() else False):
+                try:
+                    # Detect sample rate for WAV files
+                    sample_rate = 16000  # Default
+                    if audio_format.lower() == 'wav':
+                        detected_rate = self._detect_wav_sample_rate(audio_data)
+                        if detected_rate:
+                            sample_rate = detected_rate
+                    
+                    result = self._transcribe_with_google(
+                        audio_data,
+                        language_code=language_code,
+                        sample_rate=sample_rate,
+                        audio_format=audio_format
+                    )
+                    if result and result.strip():
+                        # Additional English-only check (defense in depth)
+                        if self._is_english_only(result):
+                            print(f"STT: Google transcription succeeded (fallback): '{result[:50]}...'")
+                            return result.strip()
+                        else:
+                            print(f"STT: Google result filtered (non-English): '{result[:50]}...'")
+                except Exception as e:
+                    print(f"STT: Google transcription error: {e}")
+        
+        # All attempts failed
+        print("STT: All transcription methods returned empty/None")
         return None
     
     def transcribe_chunks(self, audio_chunks: List[bytes], language_code: str = "en-US",

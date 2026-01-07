@@ -4,6 +4,8 @@ Run script for Talk With Zeno backend
 
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -43,5 +45,24 @@ if __name__ == '__main__':
     else:
         logger.info("Sentry error monitoring: Disabled (SENTRY_DSN not set)")
     
-    app.run(debug=debug, host=host, port=port)
+    # Start background thread for periodic cleanup of stale streaming sessions
+    def cleanup_sessions():
+        """Periodically clean up stale streaming sessions"""
+        from backend.services.streaming_service import get_streaming_service
+        while True:
+            try:
+                time.sleep(300)  # Run every 5 minutes
+                streaming_service = get_streaming_service()
+                streaming_service.cleanup_stale_sessions(timeout_seconds=300)
+                logger.debug(f"Session cleanup: {streaming_service.get_session_count()} active sessions")
+            except Exception as e:
+                logger.error(f"Error in session cleanup thread: {e}")
+    
+    cleanup_thread = threading.Thread(target=cleanup_sessions, daemon=True)
+    cleanup_thread.start()
+    logger.info("Background session cleanup thread started")
+    
+    # Run Flask in threaded mode to handle concurrent requests
+    # This allows STT processing and response handling to happen in parallel
+    app.run(debug=debug, host=host, port=port, threaded=True)
 

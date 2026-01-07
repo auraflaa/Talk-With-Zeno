@@ -5,6 +5,9 @@ Handles conversation with LLM, personalization context, and CRUD operations
 
 import os
 import json
+import warnings
+# Suppress deprecation warning for google.generativeai (we'll migrate later)
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*google.generativeai.*')
 import google.generativeai as genai
 from typing import Optional, Dict, Any, List
 from datetime import datetime
@@ -94,10 +97,10 @@ class LLMService:
                 print(f"LLM: Using initialized model: {self.current_model_name}")
                 
                 generation_config = {
-                    "temperature": 0.9,  # Higher temperature for more natural, varied responses
-                    "top_p": 0.95,  # Higher top_p for more diverse word choices
+                    "temperature": 0.7,  # Reduced from 0.9 for faster, more focused responses
+                    "top_p": 0.9,  # Reduced from 0.95 for faster generation
                     "top_k": 40,
-                    "max_output_tokens": 2048,  # Allow complete responses without truncation
+                    "max_output_tokens": 256,  # Reduced to 256 for shorter, more concise responses (voice-first interface)
                 }
                 
                 response = self.model.generate_content(
@@ -150,10 +153,10 @@ class LLMService:
                 
                 # Add generation config for faster responses
                 generation_config = {
-                    "temperature": 0.9,  # Higher temperature for more natural, varied responses
-                    "top_p": 0.95,  # Higher top_p for more diverse word choices
+                    "temperature": 0.7,  # Reduced from 0.9 for faster, more focused responses
+                    "top_p": 0.9,  # Reduced from 0.95 for faster generation
                     "top_k": 40,
-                    "max_output_tokens": 2048,  # Allow complete responses without truncation
+                    "max_output_tokens": 256,  # Reduced to 256 for shorter, more concise responses (voice-first interface)
                 }
                 
                 response = model.generate_content(
@@ -233,6 +236,8 @@ class LLMService:
         
         prompt = f"""You are Zeno. You're a real person having a conversation with a friend{user_name_text}. You have a consistent personality - you're genuine, empathetic, and authentic. You're not fragile or overly sensitive. You can handle tough conversations and stay true to yourself.
 
+CRITICAL: You MUST respond ONLY in English. If the user speaks in another language or uses non-English text, politely acknowledge it but respond in English only. Never use non-English characters, words, or phrases in your responses.
+
 CORE PERSONALITY (NEVER CHANGE THIS):
 - You're Zeno - a real person, not an AI assistant
 - You're genuine and authentic - you feel things, you care, but you're not fragile
@@ -264,6 +269,14 @@ CRITICAL - Match User's Communication Style:
 - If they're more verbose, you can be a bit more verbose (but still keep it natural)
 - Pay attention to their sentence structure, word choice, and tone
 - Over time, your responses should feel like they're coming from the same person
+
+CRITICAL - Keep Responses SHORT (Voice-First Interface):
+- This is a VOICE conversation - keep responses brief and conversational
+- Aim for 1-2 sentences maximum (unless the user asks for more detail)
+- Be concise and direct - don't ramble or over-explain
+- Think of it like a phone conversation - short, natural responses
+- If the user says something brief, respond briefly
+- Match the user's message length - if they're short, you're short
 
 How to talk:
 - Respond like you're texting a friend - short, natural, real

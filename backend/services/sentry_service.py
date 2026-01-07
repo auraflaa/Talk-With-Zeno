@@ -4,13 +4,26 @@ Initializes and configures Sentry for error tracking
 """
 
 import os
-import sentry_sdk
-from sentry_sdk.integrations.flask import FlaskIntegration
-from sentry_sdk.integrations.logging import LoggingIntegration
+
+# Try to import sentry_sdk - it's optional
+try:
+    import sentry_sdk
+    from sentry_sdk.integrations.flask import FlaskIntegration
+    from sentry_sdk.integrations.logging import LoggingIntegration
+    SENTRY_AVAILABLE = True
+except ImportError:
+    SENTRY_AVAILABLE = False
+    sentry_sdk = None
+    FlaskIntegration = None
+    LoggingIntegration = None
 
 
 def init_sentry():
     """Initialize Sentry error monitoring"""
+    if not SENTRY_AVAILABLE:
+        # Sentry SDK not installed - skip initialization
+        return False
+    
     sentry_dsn = os.getenv('SENTRY_DSN')
     
     if not sentry_dsn:

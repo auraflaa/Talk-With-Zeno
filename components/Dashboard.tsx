@@ -142,7 +142,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, onLogout, the
                         return {
                             ...session,
                             messages: [...session.messages, {
-                                id: Date.now().toString() + '_ai',
+                                id: `${Date.now()}_${Math.random().toString(36).substr(2, 9)}_ai`,
                                 role: 'assistant',
                                 content: "I'm listening. How is that making you feel?",
                                 timestamp: new Date()
@@ -314,7 +314,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, onLogout, the
                                         messages={activeSession.messages}
                                         onSendMessage={handleUserSendMessage}
                                         onReceiveMessage={(text) => updateActiveSessionMessages({
-                                            id: Date.now().toString() + '_ai',
+                                            id: `${Date.now()}_${Math.random().toString(36).substr(2, 9)}_ai`,
                                             role: 'assistant',
                                             content: text,
                                             timestamp: new Date()

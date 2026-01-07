@@ -6,6 +6,7 @@ Can be used to filter audio chunks before sending to STT
 
 import os
 import struct
+import io
 from typing import Optional, Tuple
 
 # Try to import numpy (required for silero-vad)
@@ -15,6 +16,14 @@ try:
 except ImportError:
     NUMPY_AVAILABLE = False
     np = None
+
+# Try to import pydub for WebM to PCM conversion
+try:
+    from pydub import AudioSegment
+    PYDUB_AVAILABLE = True
+except ImportError:
+    PYDUB_AVAILABLE = False
+    AudioSegment = None
 
 # Try to import silero-vad (primary - highest accuracy)
 try:
@@ -78,13 +87,52 @@ class VADService:
             print("  pip install webrtcvad  # For faster, lighter option")
             print("VAD: Falling back to simple energy-based detection")
     
-    def is_speech(self, audio_data: bytes, sample_rate: int = 16000) -> bool:
+    def convert_webm_to_pcm(self, webm_data: bytes, target_sample_rate: int = 16000) -> Optional[bytes]:
+        """
+        Convert WebM/Opus audio to PCM format for VAD processing
+        
+        Args:
+            webm_data: WebM/Opus audio bytes
+            target_sample_rate: Target sample rate in Hz (default: 16000)
+            
+        Returns:
+            PCM audio bytes (16-bit, mono) or None if conversion fails
+        """
+        if not PYDUB_AVAILABLE:
+            return None
+        
+        try:
+            # Load WebM audio from bytes
+            audio = AudioSegment.from_file(io.BytesIO(webm_data), format="webm")
+            
+            # Convert to mono if stereo
+            if audio.channels > 1:
+                audio = audio.set_channels(1)
+            
+            # Resample to target sample rate if needed
+            if audio.frame_rate != target_sample_rate:
+                audio = audio.set_frame_rate(target_sample_rate)
+            
+            # Convert to 16-bit PCM
+            audio = audio.set_sample_width(2)  # 16-bit = 2 bytes per sample
+            
+            # Export as raw PCM bytes
+            pcm_data = audio.raw_data
+            
+            return pcm_data
+        except Exception as e:
+            print(f"VAD: WebM to PCM conversion error: {e}")
+            return None
+    
+    def is_speech(self, audio_data: bytes, sample_rate: int = 16000, 
+                  audio_format: str = 'pcm') -> bool:
         """
         Detect if audio contains speech using silero-vad (primary) or webrtcvad (fallback)
         
         Args:
-            audio_data: Raw PCM audio bytes (16-bit, mono)
+            audio_data: Raw audio bytes (PCM or WebM/Opus)
             sample_rate: Sample rate in Hz (silero-vad supports any, webrtcvad: 8000, 16000, 32000, 48000)
+            audio_format: Format of audio_data ('pcm' or 'webm')
             
         Returns:
             True if speech detected, False if noise/silence
@@ -92,22 +140,34 @@ class VADService:
         if not audio_data or len(audio_data) < 2:
             return False
         
+        # Convert WebM to PCM if needed
+        pcm_data = audio_data
+        if audio_format.lower() == 'webm':
+            pcm_data = self.convert_webm_to_pcm(audio_data, sample_rate)
+            if pcm_data is None:
+                # Conversion failed, fall back to simple energy detection on original data
+                # This is a best-effort approach
+                return self._simple_energy_detection_webm(audio_data)
+        
+        if not pcm_data or len(pcm_data) < 2:
+            return False
+        
         # Try silero-vad first (highest accuracy)
         if self.silero_model and self.silero_utils:
             try:
-                return self._is_speech_silero(audio_data, sample_rate)
+                return self._is_speech_silero(pcm_data, sample_rate)
             except Exception as e:
                 print(f"VAD: silero-vad error: {e}, falling back to webrtcvad")
         
         # Fallback to webrtcvad
         if self.webrtc_vad:
             try:
-                return self._is_speech_webrtc(audio_data, sample_rate)
+                return self._is_speech_webrtc(pcm_data, sample_rate)
             except Exception as e:
                 print(f"VAD: webrtcvad error: {e}, falling back to simple detection")
         
         # Final fallback to simple energy-based detection
-        return self._simple_energy_detection(audio_data)
+        return self._simple_energy_detection(pcm_data)
     
     def _is_speech_silero(self, audio_data: bytes, sample_rate: int = 16000) -> bool:
         """
@@ -183,7 +243,7 @@ class VADService:
     
     def _simple_energy_detection(self, audio_data: bytes) -> bool:
         """
-        Simple energy-based voice detection (fallback)
+        Simple energy-based voice detection (fallback for PCM)
         
         Args:
             audio_data: Raw PCM audio bytes
@@ -195,7 +255,11 @@ class VADService:
             return False
         
         # Convert bytes to 16-bit integers
-        samples = struct.unpack(f'<{len(audio_data)//2}h', audio_data)
+        try:
+            samples = struct.unpack(f'<{len(audio_data)//2}h', audio_data)
+        except struct.error:
+            # Invalid PCM data
+            return False
         
         # Calculate RMS (Root Mean Square) energy
         sum_squares = sum(s * s for s in samples)
@@ -206,6 +270,24 @@ class VADService:
         
         # Threshold: consider it speech if RMS > 0.01 (1% of max)
         return normalized_rms > 0.01
+    
+    def _simple_energy_detection_webm(self, webm_data: bytes) -> bool:
+        """
+        Simple energy-based voice detection for WebM (fallback when conversion fails)
+        
+        Args:
+            webm_data: WebM/Opus audio bytes
+            
+        Returns:
+            True if likely speech, False if likely noise/silence
+        """
+        if len(webm_data) < 100:
+            return False
+        
+        # For WebM, we can only do a rough check based on file size
+        # Larger files are more likely to contain speech
+        # This is a very rough heuristic
+        return len(webm_data) > 1000  # At least 1KB
     
     def filter_speech_chunks(self, audio_chunks: list, sample_rate: int = 16000) -> list:
         """
