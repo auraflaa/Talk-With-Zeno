@@ -29,7 +29,15 @@ webrtcvad>=2.0.10  # Faster fallback option (lighter, less accurate) - INSTALLED
 setuptools>=80.0.0  # Required for webrtcvad
 
 # Audio processing for WebM to PCM conversion
-pydub>=0.25.1  # For converting WebM/Opus to PCM for VAD
+pydub>=0.25.1      # For converting WebM/Opus to PCM for VAD / STT
+
+# NOTE:
+# - There is NO separate `pyaudioop` package on PyPI (pip error you saw).
+# - `pydub` will work fine as long as `ffmpeg` is installed on your system.
+# ffmpeg is REQUIRED as a system binary for reliable WebM→WAV conversion.
+# Install separately (not via pip), e.g. on Windows:
+#   - Download from https://ffmpeg.org/download.html
+#   - Add ffmpeg.exe to your PATH
 
 # Rate limiting
 flask-limiter>=3.5.0

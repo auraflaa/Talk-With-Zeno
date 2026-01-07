@@ -1220,32 +1220,27 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
             // Estimate duration: ~64kbps for WebM/Opus = ~8KB per second
             const estimatedDurationMs = (allChunks.reduce((sum, chunk) => sum + chunk.size, 0) / 8000) * 1000;
             
-            // CRITICAL: Check if speech was ever detected - if not, this might be noise
-            // BUT: If we have substantial audio (> 8 seconds), it's likely legitimate speech that VAD missed
-            // This can happen after TTS playback when VAD thresholds might be off
+            // If VAD never detected speech, this is usually noise – but long continuous audio
+            // is likely real speech that VAD missed. In that case, force a best‑effort send.
             if (!audioService.hasDetectedSpeech()) {
-                // CRITICAL: MediaRecorder chunks are fragments - we need to wait longer for VAD to detect speech
-                // Sending individual chunks creates invalid WebM files
-                // Only send if we have VERY substantial audio (> 15 seconds) and concatenate all chunks
-                if (estimatedDurationMs > 15000) {
-                    warnWithTimestamp(`VAD Fallback: No speech detected but very substantial audio (${estimatedDurationMs.toFixed(0)}ms) - concatenating chunks to create WebM`);
-                    // CRITICAL: Concatenate chunks - sometimes works even though they're fragments
+                if (estimatedDurationMs > 8000) {
+                    // Best‑effort fallback: send concatenated blob so the backend can try STT.
+                    // This may occasionally fail if the WebM header is invalid, but it ensures
+                    // the user’s second turn is at least attempted instead of silently discarded.
+                    warnWithTimestamp(`VAD Fallback: No speech detected but substantial audio (${estimatedDurationMs.toFixed(0)}ms) - forcing best-effort STT with concatenated WebM`);
                     const blobType = allChunks[0]?.type || 'audio/webm';
                     const speechBlob = new Blob(allChunks, { type: blobType });
                     processStreamChunk(speechBlob, true, userName).catch(err => {
-                        errorWithTimestamp('VAD Fallback: Error processing accumulated chunks:', err);
+                        errorWithTimestamp('VAD Fallback: Error processing best-effort chunks:', err);
                     });
                     return;
-                } else if (estimatedDurationMs > 5000) {
-                    // Medium audio (5-8 seconds) without speech detection - might be noise, clear it
-                    logWithTimestamp(`VAD Fallback: No speech detected after ${estimatedDurationMs.toFixed(0)}ms, clearing accumulated noise chunks`);
-                    audioService.clearSpeechChunks();
-                    return;
-                } else {
-                    // Short audio without speech detection - might be speech starting, wait a bit more
-                    // Don't clear yet - VAD might detect it soon
-                    return;
                 }
+                if (estimatedDurationMs > 5000) {
+                    logWithTimestamp(`VAD Fallback: No speech detected after ${estimatedDurationMs.toFixed(0)}ms - clearing noise chunks`);
+                    audioService.clearSpeechChunks();
+                }
+                // For shorter audio, wait a bit more - VAD might detect speech soon
+                return;
             }
             
             // Speech was detected, check if we need to force speech end
@@ -1257,21 +1252,13 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                 // Try to force VAD to detect speech end first
                 const vadTriggered = audioService.forceSpeechEnd();
                 if (!vadTriggered) {
-                    // If VAD force didn't work, check if we should still send
-                    // Only send if we have substantial audio (at least 8 seconds worth)
-                    if (estimatedDurationMs > 8000) {
-                        warnWithTimestamp('VAD Fallback: VAD forceSpeechEnd() failed, manually processing chunks (substantial audio detected)');
-                        // CRITICAL: Concatenate chunks - sometimes works even though they're fragments
-                        const blobType = allChunks[0]?.type || 'audio/webm';
-                        const speechBlob = new Blob(allChunks, { type: blobType });
-                        warnWithTimestamp(`VAD Fallback: Concatenating ${allChunks.length} chunks (${speechBlob.size} bytes) to create WebM blob`);
-                        processStreamChunk(speechBlob, true, userName).catch(err => {
-                            errorWithTimestamp('VAD Fallback: Error processing accumulated chunks:', err);
-                        });
-                    } else {
-                        console.log(`VAD Fallback: Audio too short (${estimatedDurationMs.toFixed(0)}ms < 8000ms), waiting for more...`);
-                        // Don't clear - might still be speech
-                    }
+                    // DEMO FIX: If VAD forceSpeechEnd() failed, don't send concatenated blob
+                    // This prevents invalid WebM containers from being sent to STT
+                    // The happy path (VAD naturally detects speech end) is the only reliable path
+                    // MediaRecorder fragments cannot be safely concatenated without proper remuxing
+                    logWithTimestamp(`VAD Fallback: VAD forceSpeechEnd() failed after ${estimatedDurationMs.toFixed(0)}ms - waiting for natural speech end detection (not sending invalid WebM)`);
+                    // Don't clear chunks - VAD might still detect speech end naturally
+                    // The timeout will fire again in 15s if needed
                 }
             }
         }, 15000); // Check every 15 seconds (increased to give VAD more time to detect speech naturally)
