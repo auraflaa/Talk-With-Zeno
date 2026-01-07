@@ -5,6 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0" />
     <meta name="theme-color" content="#ffffff" />
     <title>Talk with Zeno</title>
+
+    <!-- Favicons -->
+    <link rel="apple-touch-icon" sizes="180x180" href="/components/favicon_io/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="/components/favicon_io/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="/components/favicon_io/favicon-16x16.png">
+    <link rel="manifest" href="/components/favicon_io/site.webmanifest">
+    <link rel="icon" type="image/x-icon" href="/components/favicon_io/favicon.ico">
     
     <!-- Fonts: Inter & Bricolage Grotesque -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -152,6 +159,408 @@
       .markdown-content ol {
         padding-left: 1.5rem;
       }
+
+      /* Butterfly animations - Sine Wave */
+      @property --progress {
+        initial-value: 0;
+        inherits: false;
+        syntax: '<number>';
+      }
+
+      :root {
+        --PI: 3.141592653589793;
+      }
+
+      .shape-container {
+        position: absolute;
+        pointer-events: none;
+        z-index: 1;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        overflow: visible;
+      }
+
+      .butterfly-container {
+        --PI: 3.141592653589793;
+        --WAVE-COUNT: 3;
+        --TOTAL-ANGLE: calc(var(--WAVE-COUNT) * 2 * var(--PI));
+        --UNIT: 1vw;
+        --CONTAINER-WIDTH: 100;
+        --direction: 1;
+        --progress: 0;
+        
+        /* Varying radius for natural flight */
+        --RADIUS-ANIMATION-ANGLE: var(--PI);
+        --r-min: 8;
+        --r-max: 20;
+        --delta-r: calc(var(--r-max) - var(--r-min));
+        --gamma-reference-angle: calc(var(--progress) * var(--RADIUS-ANIMATION-ANGLE));
+        --r: calc(var(--r-min) + var(--delta-r) * sin(var(--gamma-reference-angle)));
+        
+        /* Horizontal sine wave motion (left to right) */
+        --x-horizontal: calc(var(--progress) * (var(--CONTAINER-WIDTH) + 20) - 10);
+        --ROTATION-PER-LENGTH-UNIT: calc(var(--TOTAL-ANGLE) / var(--CONTAINER-WIDTH));
+        --alpha-reference-angle: calc(var(--ROTATION-PER-LENGTH-UNIT) * var(--x-horizontal) * 1rad);
+        --y-horizontal-wave: calc(-1 * var(--r) * sin(var(--alpha-reference-angle)));
+        
+        /* Combined positions */
+        --x: var(--x-horizontal);
+        --y-horizontal: var(--y-horizontal-wave);
+        
+        --x-with-unit: calc(var(--x) * var(--UNIT));
+        --y-with-unit: calc(var(--y-horizontal) * var(--UNIT));
+        
+        --tan: calc(var(--r) * var(--ROTATION-PER-LENGTH-UNIT) * cos(var(--alpha-reference-angle)));
+        --beta-tangent-angle: calc(atan(var(--tan)) * var(--direction));
+        
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        pointer-events: none;
+        overflow: visible;
+      }
+
+      .butterfly-container#butterfly {
+        --vertical-offset: 25vh;
+        --r-min: 8;
+        --r-max: 20;
+        --WAVE-COUNT: 3;
+        animation: butterfly-progress-1 20s linear infinite;
+        opacity: 0.4;
+      }
+
+      .butterfly-container#butterflyPink {
+        --vertical-offset: 55vh;
+        --r-min: 6;
+        --r-max: 18;
+        --WAVE-COUNT: 2.5;
+        --direction: -1;
+        animation: butterfly-progress-2 18s linear infinite 5s;
+        opacity: 0.35;
+      }
+
+      .butterfly-container#butterflySmall {
+        --vertical-offset: 80vh;
+        --r-min: 5;
+        --r-max: 15;
+        --WAVE-COUNT: 4;
+        animation: butterfly-progress-3 22s linear infinite 10s;
+        opacity: 0.3;
+      }
+
+      @keyframes butterfly-progress-1 {
+        0% { --progress: 0; }
+        100% { --progress: 1; }
+      }
+
+      @keyframes butterfly-progress-2 {
+        0% { --progress: 0; }
+        100% { --progress: 1; }
+      }
+
+      @keyframes butterfly-progress-3 {
+        0% { --progress: 0; }
+        100% { --progress: 1; }
+      }
+
+      .butterfly-container .shape {
+        --shape-width: 30px;
+        --shape-height: 30px;
+        --scale: 1;
+        font-size: 0.35px;
+        position: absolute;
+        z-index: 1;
+        top: 0;
+        left: 0;
+        width: var(--shape-width);
+        height: var(--shape-height);
+        pointer-events: none;
+        transform: 
+          translate(
+            var(--x-with-unit),
+            calc(var(--y-with-unit) + var(--vertical-offset))
+          )
+          translate(-50%, -50%)
+          scaleX(calc(var(--scale) * var(--direction)))
+          scaleY(var(--scale));
+        will-change: transform;
+      }
+
+      .shape .cartoon {
+        width: 100%;
+        height: 100%;
+        font-size: 1em !important;
+      }
+
+      #butterflyPink .shape {
+        --scale: 0.8;
+      }
+
+      #butterflySmall .shape {
+        --scale: 0.65;
+      }
+
+      /* Cartoon Butterfly Styles - Exact Design */
+      .cartoon {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%) scale(0.6);
+        width: 100%;
+        height: 100%;
+        --body: #1f7a70;
+        pointer-events: none;
+        isolation: isolate;
+      }
+
+      .cartoon div {
+        position: absolute;
+        box-sizing: border-box;
+        pointer-events: none;
+      }
+
+      .b {
+        border: 0.5em solid;
+      }
+
+      .r {
+        border-radius: 100%;
+      }
+
+      .hb::before,
+      .ha::after {
+        content: "";
+        display: block;
+        position: absolute;
+        box-sizing: border-box;
+      }
+
+      .antenna, 
+      .body {
+        width: 4%;
+        height: 4%;
+        background: var(--body);
+        top: 40%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+      }
+
+      .body::before {
+        width: 60%;
+        height: 1000%;
+        background: var(--body);
+        left: 50%;
+        transform: translate(-50%, 0);
+        border-radius: 50%;
+      }
+
+      .body::after {
+        width: 150%;
+        height: 400%;
+        background: var(--body);
+        top: 90%;
+        left: 50%;
+        transform: translate(-50%, 0);
+        border-radius: 50%;
+      }
+
+      .antenna {
+        box-shadow: 
+          -4.1em -9.1em 0 -1em var(--body),
+          4.1em -9.1em 0 -1em var(--body);
+      }
+
+      .antenna::after,
+      .antenna::before {
+        width: 150%;
+        height: 350%;
+        border-radius: 50%;
+        left: 80%;
+        bottom: 20%;
+        border: 0.25em solid transparent;
+        border-left: 0.5em solid var(--body);
+        transform: rotate(20deg);
+      }
+
+      .antenna::after {
+        border-left: 0.5em solid transparent;
+        border-right: 0.5em solid var(--body);
+        transform: rotate(-20deg);
+        left: -135%;
+      }
+
+      @keyframes wingTopFlap1 {
+        0%, 100% { 
+          transform: rotate(-12deg) rotateX(0deg);
+        }
+        50% { 
+          transform: rotate(-12deg) rotateX(50deg);
+        }
+      }
+
+      @keyframes wingTopFlap2 {
+        0%, 100% { 
+          transform: scaleX(-1) rotate(-12deg) rotateX(0deg);
+        }
+        50% { 
+          transform: scaleX(-1) rotate(-12deg) rotateX(50deg);
+        }
+      }
+
+      .wing-top {
+        top: 5%;
+        width: 50%;
+        height: 45%;
+        left: -0.125%;
+        background: linear-gradient(to bottom, #2ea896, #1f7a70);
+        border-radius: 20% 100% 10% 80%;
+        transform-origin: right bottom;
+        transform: rotate(-12deg);
+        box-shadow: 
+          inset 3.5em 1.5em 0 1em rgba(31, 122, 110, 0.3),
+          inset -0.5em 0 0 1em rgba(31, 122, 110, 0.2);
+        animation: wingTopFlap1 0.4s ease-in-out infinite;
+        overflow: hidden;
+        will-change: transform;
+      }
+
+      .wing-top::after {
+        width: 120%;
+        height: 90%;
+        border-radius: 50%;
+        transform: rotate(35deg);
+        left: 30%;
+        top: -5%;
+        box-shadow: inset 1em -2em rgba(31, 122, 110, 0.2);
+      }
+
+      .wing-top::before {
+        width: 64%;
+        height: 25%;
+        transform: rotate(0deg);
+        top: 61.5%;
+        border-radius: 50% 50% 40% 60%;
+        box-shadow: -1em -0.25em 0 1.5em rgba(31, 122, 110, 0.3);
+      }
+
+      .wing-top ~ .wing-top {
+        left: 0;
+        transform: scaleX(-1) rotate(-12deg);
+        animation: wingTopFlap2 0.4s ease-in-out infinite;
+      }
+
+      .dots {
+        width: 2em;
+        height: 2em;
+        background: white;
+        color: white;
+        left: 5%;
+        top: 10%;
+        box-shadow: -0.5em 3em,
+          -0.5em 6em 0 0.125em,
+          1.5em -2.25em #1f7a70,
+          3.5em -3em 0 -0.5em,
+          20em 7em 0 2em #1f7a70,
+          20em 7.25em 0 3em;
+      }
+
+      @keyframes wingBottomFlap1 {
+        0%, 100% { 
+          transform: rotate(55deg) rotateX(0deg);
+        }
+        50% { 
+          transform: rotate(55deg) rotateX(50deg);
+        }
+      }
+
+      @keyframes wingBottomFlap2 {
+        0%, 100% { 
+          transform: scaleX(-1) rotate(55deg) rotateX(0deg);
+        }
+        50% { 
+          transform: scaleX(-1) rotate(55deg) rotateX(50deg);
+        }
+      }
+
+      .wing-bottom {
+        width: 28%;
+        height: 40%;
+        background: linear-gradient(95deg, #2ea896, #1f7a70);
+        border-radius: 100% / 125% 125% 70% 50%;
+        transform-origin: right top;
+        transform: rotate(55deg);
+        top: 59%;
+        left: 27.5%;
+        box-shadow: inset 1em -2em 0 0.5em rgba(31, 122, 110, 0.3);
+        animation: wingBottomFlap1 0.4s ease-in-out infinite;
+        overflow: hidden;
+        will-change: transform;
+      }
+
+      .wing-bottom ~ .wing-bottom {
+        transform: scaleX(-1) rotate(55deg);
+        left: auto;
+        right: 55.5%;
+        animation: wingBottomFlap2 0.4s ease-in-out infinite;
+      }
+
+      .wing-bottom::before {
+        width: 100%;
+        height: 100%;
+        left: 55%;
+        top: -30%;
+        border-radius: 50%;
+        box-shadow: -1em 0.5em rgba(31, 122, 110, 0.2),
+          -3em 2em 0 1em #1f7a70,
+          -3em 3em 0 1.5em rgba(31, 122, 110, 0.3);
+      }
+
+      .wing-bottom::after {
+        width: 3em;
+        height: 3em;
+        background: #1f7a70;
+        top: 70%;
+        left: 15%;
+        border-radius: 50%;
+        box-shadow: 
+          2em 2em 0 -0.5em, 
+          2.75em -0.5em 0 -0.5em white,
+          4.25em 1.5em 0 -0.75em #2ea896,
+          11em -10em 0 1em,
+          15em -12em 0 -0.5em white;
+      }
+
+      /* Different colors for each butterfly */
+      #butterflyPink .cartoon {
+        --body: #2ea896;
+      }
+
+      #butterflyPink .wing-top {
+        background: linear-gradient(to bottom, #38b2a0, #2ea896);
+      }
+
+      #butterflyPink .wing-bottom {
+        background: linear-gradient(95deg, #38b2a0, #2ea896);
+      }
+
+      #butterflySmall .cartoon {
+        --body: #1a5d52;
+      }
+
+      #butterflySmall .wing-top {
+        background: linear-gradient(to bottom, #1f7a70, #1a5d52);
+      }
+
+      #butterflySmall .wing-bottom {
+        background: linear-gradient(95deg, #1f7a70, #1a5d52);
+      }
+
+
+
     </style>
     
   <script type="importmap">
@@ -170,5 +579,39 @@
   <body>
     <div id="root"></div>
   <script type="module" src="/index.tsx"></script>
+  <script>
+    // Butterfly sine wave animation
+    (function() {
+      function animateButterflies() {
+        const containers = document.querySelectorAll('.butterfly-container');
+        const startTime = performance.now();
+        
+        function update() {
+          const elapsed = performance.now() - startTime;
+          
+          containers.forEach((container, index) => {
+            // Horizontal movement only (left to right)
+            const hDuration = index === 0 ? 20000 : index === 1 ? 18000 : 22000;
+            const hDelay = index === 0 ? 0 : index === 1 ? 5000 : 10000;
+            const hAdjustedElapsed = Math.max(0, elapsed - hDelay);
+            const hProgress = (hAdjustedElapsed % hDuration) / hDuration;
+            
+            container.style.setProperty('--progress', hProgress);
+          });
+          
+          requestAnimationFrame(update);
+        }
+        
+        update();
+      }
+      
+      // Start animation when DOM is ready
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', animateButterflies);
+      } else {
+        setTimeout(animateButterflies, 100);
+      }
+    })();
+  </script>
 </body>
 </html>

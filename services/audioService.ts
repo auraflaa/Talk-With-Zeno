@@ -12,6 +12,9 @@ export class AudioService {
   private stream: MediaStream | null = null;
   private currentAudio: HTMLAudioElement | null = null;
   private currentAudioUrl: string | null = null; // Track URL for cleanup
+  private currentAudioBlob: Blob | null = null; // Store blob to recreate URL if needed
+  private currentAudioResolve: (() => void) | null = null; // Track Promise resolve for current audio
+  private currentAudioReject: ((error: Error) => void) | null = null; // Track Promise reject for current audio
   private readonly MAX_CHUNKS = 1000; // Prevent memory leak from too many chunks
   
   // VAD (Voice Activity Detection) properties
@@ -319,6 +322,9 @@ export class AudioService {
   private cleanup(): void {
     console.log('Cleaning up audio service...');
     
+    // CRITICAL: Stop and resolve any pending audio playback
+    this.stopAudio();
+    
     // Stop VAD first
     this.stopVAD();
     
@@ -392,14 +398,57 @@ export class AudioService {
 
   async playAudio(audioBlob: Blob): Promise<void> {
     return new Promise((resolve, reject) => {
-      // Only stop currently playing audio if it's not the greeting (allow greeting to play)
-      // For now, always stop previous audio to prevent overlap
-      this.stopAudio();
-      
+      // CRITICAL: Create blob URL and set up audio element FIRST
+      // This ensures we have valid references before any cleanup can happen
       const audio = new Audio();
       const url = URL.createObjectURL(audioBlob);
+      
+      // Store references immediately to prevent race conditions
+      const previousAudio = this.currentAudio;
+      const previousUrl = this.currentAudioUrl;
+      const previousBlob = this.currentAudioBlob;
+      
       this.currentAudio = audio;
-      this.currentAudioUrl = url; // Track URL for cleanup
+      this.currentAudioUrl = url;
+      this.currentAudioBlob = audioBlob;
+      this.currentAudioResolve = resolve;
+      this.currentAudioReject = reject;
+      
+      // NOW stop previous audio (if any) - but don't revoke URL if it's still needed
+      // Only stop if there's actually a different audio playing
+      if (previousAudio && previousAudio !== audio) {
+        try {
+          // Pause and clear previous audio, but delay URL revocation
+          if (!previousAudio.paused) {
+            previousAudio.pause();
+          }
+          previousAudio.src = '';
+          previousAudio.onended = null;
+          previousAudio.onerror = null;
+          
+          // Revoke previous URL after a delay to ensure audio element is done with it
+          if (previousUrl && previousUrl !== url) {
+            setTimeout(() => {
+              try {
+                URL.revokeObjectURL(previousUrl);
+              } catch (e) {
+                // Ignore if already revoked
+              }
+            }, 200); // Increased delay to ensure audio element has released the URL
+          }
+        } catch (e) {
+          console.warn('Error stopping previous audio:', e);
+        }
+      } else if (previousUrl && previousUrl !== url) {
+        // No previous audio element, but URL exists - revoke it
+        setTimeout(() => {
+          try {
+            URL.revokeObjectURL(previousUrl);
+          } catch (e) {
+            // Ignore if already revoked
+          }
+        }, 200);
+      }
 
       // Ensure URL is always revoked, even on errors
       const cleanup = () => {
@@ -410,18 +459,36 @@ export class AudioService {
         if (this.currentAudio === audio) {
           this.currentAudio = null;
         }
+        if (this.currentAudioBlob === audioBlob) {
+          this.currentAudioBlob = null;
+        }
+        // Clear Promise handlers
+        this.currentAudioResolve = null;
+        this.currentAudioReject = null;
       };
 
       audio.onended = () => {
         console.log('Audio playback ended - audio finished playing completely');
-        cleanup();
-        resolve();
+        // Only resolve if Promise hasn't been resolved yet (e.g., by stopAudio())
+        if (this.currentAudioResolve === resolve) {
+          cleanup();
+          resolve();
+        } else {
+          // Promise was already resolved/rejected, just cleanup
+          cleanup();
+        }
       };
 
       audio.onerror = (error) => {
         console.error('Audio playback error:', error, audio.error);
-        cleanup();
-        reject(new Error(`Failed to play audio: ${audio.error?.message || 'Unknown error'}`));
+        // Only reject if Promise hasn't been resolved yet
+        if (this.currentAudioReject === reject) {
+          cleanup();
+          reject(new Error(`Failed to play audio: ${audio.error?.message || 'Unknown error'}`));
+        } else {
+          // Promise was already resolved/rejected, just cleanup
+          cleanup();
+        }
       };
 
       audio.oncanplaythrough = () => {
@@ -505,8 +572,161 @@ export class AudioService {
                                         if (audio.currentTime > 0.1) {
                                             audio.currentTime = 0;
                                         }
+                                        
+                                        // CRITICAL: Check if blob URL is still valid before playing
+                                        // If the URL was revoked (e.g., by cleanup), recreate it
+                                        if (!audio.src || audio.src === '' || audio.src === 'null' || audio.src.indexOf('blob:') === -1) {
+                                            console.warn('Audio src was cleared or invalid, recreating blob URL');
+                                            // Recreate blob URL if it was revoked
+                                            if (this.currentAudioBlob && this.currentAudio === audio) {
+                                                // We still have the blob, recreate the URL
+                                                const newUrl = URL.createObjectURL(this.currentAudioBlob);
+                                                audio.src = newUrl;
+                                                this.currentAudioUrl = newUrl;
+                                                // Revoke the old URL reference (if it still exists)
+                                                try {
+                                                    if (url && url !== newUrl) {
+                                                        URL.revokeObjectURL(url);
+                                                    }
+                                                } catch (e) {
+                                                    // Ignore if already revoked
+                                                }
+                                                audio.load();
+                                                // Wait a bit for the new URL to load, then check again
+                                                setTimeout(() => {
+                                                    if (audio.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA) {
+                                                        console.log('Audio fully buffered after URL recreation, starting from beginning');
+                                                        resolve(audio.play());
+                                                    } else {
+                                                        // Wait for metadata again
+                                                        audio.addEventListener('loadedmetadata', () => {
+                                                            setTimeout(() => {
+                                                                console.log('Audio fully buffered, starting from beginning (buffered:', bufferedEnd.toFixed(2), 's, duration:', duration.toFixed(2), 's, currentTime:', audio.currentTime, ')');
+                                                                resolve(audio.play());
+                                                            }, 50);
+                                                        }, { once: true });
+                                                    }
+                                                }, 100);
+                                                return true;
+                                            } else {
+                                                // Can't recover - reject
+                                                reject(new Error('Audio source was cleared and cannot be recovered'));
+                                                return true;
+                                            }
+                                        }
+                                        
+                                        // FINAL CHECK: Verify blob URL is still valid right before playing
+                                        // This catches cases where URL was revoked between check and play()
+                                        if (!audio.src || audio.src === '' || audio.src === 'null' || !audio.src.startsWith('blob:')) {
+                                            console.warn('Audio src invalid right before play(), recreating blob URL');
+                                            if (this.currentAudioBlob && this.currentAudio === audio) {
+                                                const newUrl = URL.createObjectURL(this.currentAudioBlob);
+                                                audio.src = newUrl;
+                                                this.currentAudioUrl = newUrl;
+                                                try {
+                                                    if (url && url !== newUrl) {
+                                                        URL.revokeObjectURL(url);
+                                                    }
+                                                } catch (e) {
+                                                    // Ignore
+                                                }
+                                                audio.load();
+                                                // Wait for new URL to load
+                                                audio.addEventListener('canplaythrough', () => {
+                                                    audio.pause();
+                                                    audio.currentTime = 0;
+                                                    setTimeout(() => {
+                                                        console.log('Audio ready after URL recreation, starting playback');
+                                                        resolve(audio.play());
+                                                    }, 50);
+                                                }, { once: true });
+                                                return true;
+                                            } else {
+                                                reject(new Error('Audio source invalid and cannot be recovered'));
+                                                return true;
+                                            }
+                                        }
+                                        
                                         console.log('Audio fully buffered, starting from beginning (buffered:', bufferedEnd.toFixed(2), 's, duration:', duration.toFixed(2), 's, currentTime:', audio.currentTime, ')');
-                                        resolve(audio.play());
+                                        
+                                        // Try to play - if it fails due to revoked URL, catch and recover
+                                        try {
+                                            const playPromise = audio.play();
+                                            if (playPromise) {
+                                                // Modern browsers return a Promise
+                                                playPromise.catch((playError) => {
+                                                    // Handle play() failure
+                                                    if (playError && (playError.name === 'NotSupportedError' || 
+                                                        (playError.message && playError.message.includes('supported sources')))) {
+                                                        console.warn('play() failed due to revoked URL, recreating...');
+                                                        if (this.currentAudioBlob && this.currentAudio === audio) {
+                                                            const newUrl = URL.createObjectURL(this.currentAudioBlob);
+                                                            audio.src = newUrl;
+                                                            this.currentAudioUrl = newUrl;
+                                                            try {
+                                                                if (url && url !== newUrl) {
+                                                                    URL.revokeObjectURL(url);
+                                                                }
+                                                            } catch (e) {
+                                                                // Ignore
+                                                            }
+                                                            audio.load();
+                                                            audio.addEventListener('canplaythrough', () => {
+                                                                audio.pause();
+                                                                audio.currentTime = 0;
+                                                                setTimeout(() => {
+                                                                    const retryPlay = audio.play();
+                                                                    if (retryPlay) {
+                                                                        retryPlay.catch((retryError) => {
+                                                                            console.error('Retry play() also failed:', retryError);
+                                                                            // Don't reject here - let the error handler in playWhenReady handle it
+                                                                        });
+                                                                    }
+                                                                }, 50);
+                                                            }, { once: true });
+                                                        }
+                                                    }
+                                                    // If it's not a NotSupportedError, the error will be handled by the outer catch
+                                                });
+                                            }
+                                            // Resolve with the play promise (or undefined for older browsers)
+                                            resolve(playPromise);
+                                        } catch (syncError) {
+                                            // Synchronous error from play()
+                                            if (syncError && (syncError.name === 'NotSupportedError' || 
+                                                (syncError.message && syncError.message.includes('supported sources')))) {
+                                                console.warn('play() threw sync error due to revoked URL, recreating...');
+                                                if (this.currentAudioBlob && this.currentAudio === audio) {
+                                                    const newUrl = URL.createObjectURL(this.currentAudioBlob);
+                                                    audio.src = newUrl;
+                                                    this.currentAudioUrl = newUrl;
+                                                    try {
+                                                        if (url && url !== newUrl) {
+                                                            URL.revokeObjectURL(url);
+                                                        }
+                                                    } catch (e) {
+                                                        // Ignore
+                                                    }
+                                                    audio.load();
+                                                    audio.addEventListener('canplaythrough', () => {
+                                                        audio.pause();
+                                                        audio.currentTime = 0;
+                                                        setTimeout(() => {
+                                                            try {
+                                                                const retryPlay = audio.play();
+                                                                resolve(retryPlay);
+                                                            } catch (retryError) {
+                                                                reject(retryError);
+                                                            }
+                                                        }, 50);
+                                                    }, { once: true });
+                                                } else {
+                                                    reject(syncError);
+                                                }
+                                            } else {
+                                                reject(syncError);
+                                            }
+                                        }
                                     }, 50); // 50ms delay to ensure currentTime is set and audio is paused
                                     return true;
                                 }
@@ -558,9 +778,18 @@ export class AudioService {
                         audio.addEventListener('loadedmetadata', onLoadedMetadata, { once: true });
                     }
                     
-                    audio.addEventListener('error', () => {
+                    audio.addEventListener('error', (event) => {
                         clearTimeout(timeout);
-                        reject(new Error('Audio load error'));
+                        const errorMsg = audio.error 
+                            ? `Audio load error: ${audio.error.message} (code: ${audio.error.code})`
+                            : 'Audio load error: Unknown error';
+                        console.error('Audio element error event:', errorMsg, {
+                            readyState: audio.readyState,
+                            networkState: audio.networkState,
+                            src: audio.src?.substring(0, 50) + '...',
+                            blobSize: audioBlob.size
+                        });
+                        reject(new Error(errorMsg));
                     }, { once: true });
                 });
             };
@@ -587,12 +816,22 @@ export class AudioService {
             // Ignore AbortError - it's expected if audio is interrupted
             if (error.name === 'AbortError') {
               console.log('Audio play() interrupted (expected) - audio was stopped before playing');
-              cleanup();
-              resolve(); // Resolve instead of reject for AbortError
+              // Only resolve if Promise hasn't been resolved yet (e.g., by stopAudio())
+              if (this.currentAudioResolve === resolve) {
+                cleanup();
+                resolve(); // Resolve instead of reject for AbortError
+              } else {
+                cleanup();
+              }
             } else {
               console.error('Audio play() failed:', error);
-              cleanup();
-              reject(error);
+              // Only reject if Promise hasn't been resolved yet
+              if (this.currentAudioReject === reject) {
+                cleanup();
+                reject(error);
+              } else {
+                cleanup();
+              }
             }
           });
       } else {
@@ -616,6 +855,16 @@ export class AudioService {
     if (this.currentAudio) {
       try {
         console.log('Stopping current audio playback');
+        
+        // CRITICAL: Resolve the pending Promise if it exists
+        // This ensures isProcessing gets reset even if audio is stopped early
+        if (this.currentAudioResolve) {
+          console.log('Resolving pending audio playback Promise (audio stopped early)');
+          this.currentAudioResolve();
+          this.currentAudioResolve = null;
+          this.currentAudioReject = null;
+        }
+        
         // Don't pause if already paused/ended to avoid AbortError
         if (!this.currentAudio.paused) {
           this.currentAudio.pause();
@@ -627,25 +876,63 @@ export class AudioService {
         this.currentAudio.oncanplaythrough = null;
         this.currentAudio.onloadstart = null;
         this.currentAudio.onloadeddata = null;
-        // Clean up the audio element
-        this.currentAudio.src = '';
-        this.currentAudio.load(); // Reset audio element
+        
+        // CRITICAL: Don't revoke the blob URL immediately if audio is still loading
+        // Wait a bit to ensure the audio element has finished using the URL
+        // Only clear the src and load if audio is not in a loading state
+        const isReady = this.currentAudio.readyState >= HTMLMediaElement.HAVE_METADATA;
+        if (isReady) {
+          // Audio has loaded, safe to clear src
+          this.currentAudio.src = '';
+          this.currentAudio.load(); // Reset audio element
+        }
+        
+        // Store URL and blob for delayed revocation
+        const urlToRevoke = this.currentAudioUrl;
+        const blobToClear = this.currentAudioBlob;
         this.currentAudio = null;
+        this.currentAudioUrl = null;
+        this.currentAudioBlob = null;
+        
+        // Revoke URL after a short delay to ensure audio element is done with it
+        if (urlToRevoke) {
+          setTimeout(() => {
+            try {
+              URL.revokeObjectURL(urlToRevoke);
+            } catch (error) {
+              console.warn('Error revoking audio URL:', error);
+            }
+          }, 100); // Small delay to ensure audio element has released the URL
+        }
       } catch (error) {
         console.error('Error stopping audio:', error);
         this.currentAudio = null;
+        // Still try to revoke URL on error
+        if (this.currentAudioUrl) {
+          const urlToRevoke = this.currentAudioUrl;
+          this.currentAudioUrl = null;
+          this.currentAudioBlob = null;
+          setTimeout(() => {
+            try {
+              URL.revokeObjectURL(urlToRevoke);
+            } catch (e) {
+              console.warn('Error revoking audio URL on error:', e);
+            }
+          }, 100);
+        }
       }
-    }
-    // Revoke URL if it exists (always cleanup)
-    if (this.currentAudioUrl) {
-      try {
-        URL.revokeObjectURL(this.currentAudioUrl);
-        this.currentAudioUrl = null;
-      } catch (error) {
-        console.warn('Error revoking audio URL:', error);
-        // Still clear the reference even if revoke fails
-        this.currentAudioUrl = null;
-      }
+    } else if (this.currentAudioUrl) {
+      // Audio element is null but URL exists - revoke it
+      const urlToRevoke = this.currentAudioUrl;
+      this.currentAudioUrl = null;
+      this.currentAudioBlob = null;
+      setTimeout(() => {
+        try {
+          URL.revokeObjectURL(urlToRevoke);
+        } catch (error) {
+          console.warn('Error revoking audio URL:', error);
+        }
+      }, 100);
     }
   }
 

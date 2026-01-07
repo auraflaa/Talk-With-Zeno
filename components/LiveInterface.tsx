@@ -93,7 +93,13 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
             if (audioService.isRecording() && !isMicActive) {
                 audioService.forceStop();
             }
-            audioService.stopAudio();
+            // CRITICAL: Don't stop audio if greeting is playing (React Strict Mode causes unmount/remount)
+            // Let the greeting finish playing - it will clean up itself when done
+            if (!isGreetingPlayingRef.current) {
+                audioService.stopAudio();
+            } else {
+                console.log('LiveInterface: Skipping audio stop - greeting is playing (React Strict Mode unmount)');
+            }
         };
     }, []);
 
@@ -255,16 +261,17 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                         
                         // Play audio immediately - ensure it plays completely
                         try {
-                            // Stop any current audio first
-                            audioService.stopAudio();
-                            
-                            // Small delay to ensure audio service is ready
-                            await new Promise(resolve => setTimeout(resolve, 100));
-                            
+                            // Decode audio bytes first and create blob
                             const audioBytes = Uint8Array.from(atob(cachedGreeting.audioBase64), c => c.charCodeAt(0));
                             // Try WAV first, fallback to MP3 if needed
                             let audioBlob = new Blob([audioBytes], { type: 'audio/wav' });
                             console.log('GreetingService: Playing cached greeting audio (size:', audioBlob.size, 'bytes)');
+                            
+                            // CRITICAL: Don't stop audio here - let playAudio handle it
+                            // Stopping audio might clear the audio element, causing "no supported sources" error
+                            
+                            // Small delay to ensure audio service is ready
+                            await new Promise(resolve => setTimeout(resolve, 100));
                             
                             // IMPORTANT: Wait for greeting audio to play completely before continuing
                             // This ensures the greeting is heard fully before microphone auto-starts
@@ -275,11 +282,11 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                                 await audioService.playAudio(audioBlob);
                                 console.log('GreetingService: Cached greeting audio finished playing completely');
                                 isGreetingPlayingRef.current = false; // Mark greeting as finished
-                                isGreetingPlayingRef.current = false; // Mark greeting as finished
                             } catch (error) {
                                 // If WAV fails, try MP3 format
                                 if (error instanceof Error && !error.name.includes('AbortError')) {
                                     console.warn('GreetingService: WAV format failed, trying MP3:', error);
+                                    // Create new blob with MP3 type
                                     audioBlob = new Blob([audioBytes], { type: 'audio/mpeg' });
                                     try {
                                         await audioService.playAudio(audioBlob);
@@ -663,21 +670,34 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                         console.log(`Streaming: [CLEANUP] Cleared processed chunks (${chunksBeforeClear} → ${chunksAfterClear}), ready for new audio. Session:`, streamingSessionIdRef.current);
 
                         // Get LLM response
+                        console.log('Streaming: About to call processStreamedText...');
                         llmResponse = await apiService.processStreamedText(
                             result.session_id,
                             result.merged_text.trim(),
                             userName
                         );
+                        console.log('Streaming: processStreamedText returned, llmResponse:', {
+                            hasLlmResponse: !!llmResponse,
+                            hasAudio: !!(llmResponse?.audio_base64 || llmResponse?.audioBase64),
+                            keys: llmResponse ? Object.keys(llmResponse) : []
+                        });
 
-                        if (!isMountedRef.current) return;
+                        // CRITICAL: Don't return early if we have audio to play
+                        // Even if component appears unmounted (could be React strict mode re-render),
+                        // we should still process the response and play audio
+                        if (!isMountedRef.current) {
+                            console.warn('Streaming: Component appears unmounted, but continuing to process response (may be React strict mode)');
+                        }
+
+                        console.log('Streaming: Processing LLM response...');
 
                         // Update conversation ID
-                        if (llmResponse.conversation_id) {
+                        if (llmResponse?.conversation_id) {
                             conversationIdRef.current = llmResponse.conversation_id;
                         }
 
                         // Add assistant message
-                        if (llmResponse.text_response) {
+                        if (llmResponse?.text_response) {
                             onReceiveMessage(llmResponse.text_response.trim());
                         }
 
@@ -687,23 +707,43 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                         try {
                             // Clear backend session chunks after response is ready
                             // This ensures fresh start for next interaction
+                            // NOTE: Don't clear chunks here - they will be cleared after audio playback
+                            // This ensures headerChunk is preserved for subsequent utterances
                             if (streamingSessionIdRef.current) {
-                                // Clear chunks by sending empty chunk or calling clear endpoint
-                                // For now, we'll let the backend clear on next chunk, but we can also clear frontend chunks
-                                const chunksBeforeClear = audioService.getAllChunks().length;
-                                audioService.clearSpeechChunks(); // Clear frontend chunks
-                                const chunksAfterClear = audioService.getAllChunks().length;
-                                console.log(`Streaming: [CLEANUP] TTS response ready, cleared old accumulated chunks (${chunksBeforeClear} → ${chunksAfterClear})`);
+                                console.log(`Streaming: [CLEANUP] TTS response ready, chunks will be cleared after audio playback`);
                             }
                         } catch (clearError) {
                             console.warn('Streaming: Error clearing chunks after response:', clearError);
                         }
                         
+                        // CRITICAL: Don't clear chunks here - wait until after audio playback
+                        // Moving chunk clearing to after audio playback to preserve headerChunk
+                        
                         // Play audio (always play if available, recording should continue during playback)
                         // IMPORTANT: Recording continues while TTS plays - user can interrupt by speaking
-                        if (llmResponse.audio_base64) {
+                        console.log('Streaming: About to check for audio_base64, llmResponse exists:', !!llmResponse);
+                        if (!llmResponse) {
+                            console.error('Streaming: llmResponse is null/undefined!');
+                            throw new Error('llmResponse is null or undefined');
+                        }
+                        
+                        // Check for both snake_case and camelCase property names
+                        const audioBase64 = llmResponse.audio_base64 || llmResponse.audioBase64;
+                        console.log('Streaming: Checking audio_base64:', { 
+                            hasAudioBase64: !!audioBase64, 
+                            audioBase64Length: audioBase64?.length || 0,
+                            hasSnakeCase: !!llmResponse.audio_base64,
+                            hasCamelCase: !!llmResponse.audioBase64,
+                            llmResponseKeys: Object.keys(llmResponse),
+                            llmResponseType: typeof llmResponse
+                        });
+                        
+                        if (audioBase64) {
+                            console.log('Streaming: Audio found, starting playback, audioBase64 length:', audioBase64.length);
+                            console.log('Streaming: Audio found, starting playback...');
                             try {
                                 logWithTimestamp('Streaming: Playing TTS audio response (recording continues)');
+                                console.log('Streaming: About to decode audio base64, length:', audioBase64.length);
                                 
                                 // CRITICAL: Verify recording is still active before playing audio
                                 if (!audioService.isRecording() && isMicActive) {
@@ -716,8 +756,19 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                                     }
                                 }
                                 
-                                const audioBytes = Uint8Array.from(atob(llmResponse.audio_base64), c => c.charCodeAt(0));
+                                // Decode audio with error handling
+                                let audioBytes: Uint8Array;
+                                try {
+                                    console.log('Streaming: Decoding base64 audio...');
+                                    audioBytes = Uint8Array.from(atob(audioBase64), c => c.charCodeAt(0));
+                                    console.log('Streaming: Audio decoded successfully, size:', audioBytes.length);
+                                } catch (decodeError) {
+                                    console.error('Streaming: Error decoding audio base64:', decodeError);
+                                    throw new Error(`Failed to decode audio: ${decodeError instanceof Error ? decodeError.message : 'Unknown error'}`);
+                                }
+                                
                                 const audioBlob = new Blob([audioBytes], { type: 'audio/wav' });
+                                console.log('Streaming: Audio blob created, size:', audioBlob.size, 'type:', audioBlob.type);
                                 // Play audio without blocking - recording continues in background
                                 // VAD will stop audio if user speaks (handled in VAD callback)
                                 audioService.playAudio(audioBlob).then(() => {
@@ -787,8 +838,21 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                                 });
                             } catch (error) {
                                 console.error('Streaming: Error preparing audio:', error);
+                                // CRITICAL: Ensure isProcessing is reset even on error
+                                if (isMountedRef.current) {
+                                    setIsProcessing(false);
+                                }
+                                // Clear chunks even on error
+                                audioService.clearSpeechChunks();
                             }
                         } else {
+                            console.warn('Streaming: No audio_base64 in LLM response - checking response structure:', {
+                                hasLlmResponse: !!llmResponse,
+                                llmResponseType: typeof llmResponse,
+                                llmResponseKeys: llmResponse ? Object.keys(llmResponse) : [],
+                                audio_base64: llmResponse?.audio_base64,
+                                audioBase64: llmResponse?.audioBase64
+                            });
                             warnWithTimestamp('Streaming: No audio_base64 in LLM response - TTS may have failed (rate limit or provider error)');
                             // Show notification that audio is not available
                             setNotification({ 
@@ -810,8 +874,9 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
                         // CRITICAL: Only reset isProcessing if there's no audio to play
                         // If audio is playing, isProcessing will be reset in the audio callback
                         // This prevents race conditions where new speech arrives before TTS finishes
-                        // Check if llmResponse exists and has audio_base64
-                        if (!llmResponse || !llmResponse.audio_base64) {
+                        // Check if llmResponse exists and has audio_base64 (check both naming conventions)
+                        const hasAudio = llmResponse && (llmResponse.audio_base64 || llmResponse.audioBase64);
+                        if (!llmResponse || !hasAudio) {
                             // No audio to play, reset immediately
                             setIsProcessing(false);
                             console.log('Streaming: Processing complete (no audio), ready for new speech');
@@ -1214,7 +1279,7 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
         vadFallbackTimeoutRef.current = setTimeout(() => {
             if (!isMountedRef.current || isProcessing || !isMicActive) return;
             
-            const allChunks = audioService.getAllChunks();
+            const allChunks = audioService.getAllChunksWithHeader();
             if (allChunks.length === 0) return;
             
             // Estimate duration: ~64kbps for WebM/Opus = ~8KB per second
@@ -1303,7 +1368,7 @@ export const LiveInterface: React.FC<LiveInterfaceProps> = ({
             console.warn('Maximum recording duration reached (120s), auto-stopping...');
             if (isMicActive && !isProcessing && audioService.isRecording()) {
                 // Before stopping, try to process any accumulated chunks
-                const allChunks = audioService.getAllChunks();
+                const allChunks = audioService.getAllChunksWithHeader();
                 if (allChunks.length > 0) {
                     console.log('Max duration reached: Processing accumulated chunks before stopping');
                     const speechBlob = new Blob(allChunks, { type: 'audio/webm' });

@@ -57,6 +57,52 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onLogin }) => {
           </svg>
       </div>
 
+      {/* Butterfly Animations */}
+      <div className="absolute top-0 left-0 w-full h-full overflow-hidden pointer-events-none" style={{ zIndex: 1 }}>
+        <div className="shape-container butterfly-container" id="butterfly">
+          <div className="shape cartoon hb">
+            <div className="wing-bottom ha hb"></div>
+            <div className="wing-top ha hb">
+              <div className="dots r"></div>
+            </div>
+            <div className="wing-bottom ha hb"></div>
+            <div className="wing-top ha hb">
+              <div className="dots r"></div>
+            </div>
+            <div className="body r ha hb"></div>
+            <div className="antenna r ha hb"></div>
+          </div>
+        </div>
+        <div className="shape-container butterfly-container" id="butterflyPink">
+          <div className="shape cartoon hb">
+            <div className="wing-bottom ha hb"></div>
+            <div className="wing-top ha hb">
+              <div className="dots r"></div>
+            </div>
+            <div className="wing-bottom ha hb"></div>
+            <div className="wing-top ha hb">
+              <div className="dots r"></div>
+            </div>
+            <div className="body r ha hb"></div>
+            <div className="antenna r ha hb"></div>
+          </div>
+        </div>
+        <div className="shape-container butterfly-container" id="butterflySmall">
+          <div className="shape cartoon hb">
+            <div className="wing-bottom ha hb"></div>
+            <div className="wing-top ha hb">
+              <div className="dots r"></div>
+            </div>
+            <div className="wing-bottom ha hb"></div>
+            <div className="wing-top ha hb">
+              <div className="dots r"></div>
+            </div>
+            <div className="body r ha hb"></div>
+            <div className="antenna r ha hb"></div>
+          </div>
+        </div>
+      </div>
+
       <div className="relative z-10 w-full max-w-lg px-6 pt-12 md:pt-20 flex flex-col items-center">
         
         {/* Typography */}

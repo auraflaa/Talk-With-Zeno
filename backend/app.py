@@ -104,6 +104,52 @@ def health_check():
     }), 200
 
 
+@app.route('/api/user/personalization', methods=['GET', 'PUT'])
+def user_personalization():
+    """
+    Get or update user personalization data.
+    
+    GET:
+      - query params: user_id (required)
+      - returns: full personalization JSON for that user
+    
+    PUT:
+      - JSON body: { "user_id": "...", "personalization": { ...partial or full... } }
+      - merges provided personalization over existing and persists it
+    """
+    from backend.services.storage_service import get_storage_service
+    storage = get_storage_service()
+
+    if request.method == 'GET':
+        user_id = request.args.get('user_id')
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+        data = storage.load_personalization(user_id)
+        return jsonify(data), 200
+
+    # PUT
+    try:
+        payload = request.json or {}
+    except Exception:
+        payload = {}
+
+    user_id = payload.get('user_id')
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+
+    existing = storage.load_personalization(user_id)
+    updates = payload.get('personalization') or {}
+
+    # Shallow merge top-level, but preserve nested structures like preferences
+    merged = {**existing, **{k: v for k, v in updates.items() if k != "preferences"}}
+    if "preferences" in updates:
+        merged_prefs = {**existing.get("preferences", {}), **updates["preferences"]}
+        merged["preferences"] = merged_prefs
+
+    if storage.save_personalization(user_id, merged):
+        return jsonify(merged), 200
+    return jsonify({"error": "Failed to save personalization"}), 500
+
 @app.route('/api/metrics', methods=['GET'])
 def get_metrics():
     """Get metrics summary for monitoring"""
@@ -1643,6 +1689,7 @@ def get_latest_audio(conversation_id):
 
 
 @app.route('/api/conversations', methods=['GET'])
+@limiter.limit("100 per minute")  # More lenient for listing (lightweight operation)
 def list_conversations():
     """List all conversations for a user"""
     try:
@@ -1659,6 +1706,7 @@ def list_conversations():
 
 
 @app.route('/api/conversations/<conversation_id>', methods=['GET'])
+@limiter.limit("100 per minute")  # More lenient for individual conversation loads (lightweight operation)
 def get_conversation(conversation_id):
     """Get a specific conversation"""
     try:

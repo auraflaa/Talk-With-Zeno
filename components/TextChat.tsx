@@ -57,7 +57,9 @@ export const TextChat: React.FC<TextChatProps> = ({ messages, onSendMessage, onS
                 <div className="py-6 space-y-6 min-h-full">
                     {messages.length === 0 && !isProcessing && (
                         <div className="flex items-center justify-center h-full">
-                            <p className="text-base-content/50 text-sm">Start a conversation by typing a message below</p>
+                            <p className="text-sm text-base-content/80 dark:text-base-content">
+                                Start a conversation by typing a message below
+                            </p>
                         </div>
                     )}
                     {messages.map((msg) => (

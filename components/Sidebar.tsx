@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { MessageSquare, Plus, Sun, Moon, LogOut, MoreHorizontal, Pencil, Trash2, Share2, Check, X } from 'lucide-react';
+import { MessageSquare, Plus, Sun, Moon, LogOut, MoreHorizontal, Pencil, Trash2, Share2, Check, X, Settings } from 'lucide-react';
 import { ChatSession } from '../types';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -15,6 +15,7 @@ interface SidebarProps {
   onRenameSession: (id: string, newTitle: string) => void;
   theme: 'light' | 'dark';
   toggleTheme: () => void;
+  onOpenSettings?: () => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({ 
@@ -26,7 +27,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
     onDeleteSession,
     onRenameSession,
     theme,
-    toggleTheme
+    toggleTheme,
+    onOpenSettings,
 }) => {
     const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
     
@@ -69,7 +71,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     <div className="flex flex-col h-full p-4 bg-base-100 text-base-content transition-colors duration-300">
         {/* Brand - Desktop Only */}
         <div className="hidden lg:block pb-6 pl-2">
-            <h2 className="text-2xl font-bold text-base-content tracking-tight font-display">Talk with Zeno</h2>
+            <h2 className="text-2xl font-extrabold text-base-content tracking-tight font-display">Talk with Zeno</h2>
         </div>
 
         {/* New Chat Button - Semantic Primary */}
@@ -82,7 +84,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </button>
 
         <div className="flex-1 overflow-y-auto py-6 space-y-1">
-            <div className="text-xs font-bold text-base-content/40 uppercase px-2 mb-2">Recent</div>
+            <div className="text-xs font-semibold tracking-wide text-base-content/80 uppercase px-2 mb-2">Recent</div>
             <ul className="menu w-full p-0 gap-1 rounded-box">
                 {sessions.map((session) => (
                     <li key={session.id} className="relative group">
@@ -119,7 +121,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
                                     `}
                                 >
                                     <MessageSquare size={16} className={`flex-shrink-0 ${activeSessionId === session.id ? 'text-primary' : 'text-base-content/40'}`} />
-                                    <span className="truncate block text-sm">{session.title}</span>
+                                    <span className="truncate block text-sm font-medium text-base-content">
+                                        {session.title}
+                                    </span>
                                 </button>
 
                                 {/* Three Dots Menu */}
@@ -156,24 +160,33 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </ul>
         </div>
 
-        <div className="border-t border-base-200 pt-4 mt-auto space-y-2">
-            
+        {/* Bottom actions pinned to bottom of sidebar */}
+        <div className="mt-auto pt-4 pb-2 border-t border-base-200 space-y-1">
+            {/* Settings */}
+            <button
+                onClick={onOpenSettings}
+                className="btn btn-ghost btn-block justify-start gap-3 font-normal text-base-content hover:bg-base-200"
+            >
+                <Settings size={18} />
+                Settings
+            </button>
+
             {/* Theme Toggle */}
             <button 
                 onClick={toggleTheme}
-                className="btn btn-ghost btn-block justify-start gap-3 font-normal text-base-content/70 hover:bg-base-200"
+                className="btn btn-ghost btn-block justify-start gap-3 font-normal text-base-content hover:bg-base-200"
             >
                 {theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}
-                {theme === 'light' ? 'Dark Mode' : 'Light Mode'}
+                <span>{theme === 'light' ? 'Dark Mode' : 'Light Mode'}</span>
             </button>
-
+            
             {/* Logout Trigger */}
             <button 
                 onClick={() => setShowLogoutConfirm(true)} 
                 className="btn btn-ghost btn-block justify-start gap-3 font-normal text-error hover:bg-error/10 text-left"
             >
                 <LogOut size={18} />
-                Sign out
+                <span>Sign out</span>
             </button>
         </div>
     </div>

@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Sidebar } from './Sidebar';
+import { SettingsModal } from './SettingsModal';
 import { HomePage } from './HomePage';
 import { LiveInterface } from './LiveInterface';
 import { InteractionMode, ChatSession, Message, User } from '../types';
@@ -72,31 +73,135 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, onLogout, the
     const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
     const [interactionMode, setInteractionMode] = useState<InteractionMode>(InteractionMode.TEXT);
     const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+    const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+    
+    // Ref to prevent concurrent conversation loading
+    const isLoadingConversationsRef = useRef(false);
 
     // --- LOAD CHATS (Scoped to User) ---
     useEffect(() => {
+        // Prevent concurrent executions (React Strict Mode causes double renders in dev)
+        if (isLoadingConversationsRef.current) {
+            console.log('Dashboard: Conversation load already in progress, skipping...');
+            return;
+        }
+        
+        let isCancelled = false;
+        isLoadingConversationsRef.current = true;
+
         // Reset state first to ensure no bleed-over if user switched quickly
         setSessions([]);
         setActiveSessionId(null);
 
-        const saved = localStorage.getItem(STORAGE_KEY);
-        if (saved) {
+        // Always try loading from backend first, then fallback to local storage
+        (async () => {
             try {
-                const parsed = JSON.parse(saved);
-                const restoredSessions = parsed.map((s: any) => ({
-                    ...s,
-                    date: new Date(s.date),
-                    messages: s.messages.map((m: any) => ({...m, timestamp: new Date(m.timestamp)}))
-                }));
-                setSessions(restoredSessions);
-            } catch (e) {
-                console.error("Failed to parse sessions", e);
-                setSessions([]);
+                const { apiService } = await import('../services/apiService');
+                const summaries = await apiService.listConversations(currentUser.id);
+                
+                if (isCancelled) return;
+                
+                if (summaries && summaries.length > 0) {
+                    // Limit to most recent 20 conversations to prevent excessive API calls
+                    const MAX_CONVERSATIONS = 20;
+                    const sortedSummaries = [...summaries].sort((a, b) => {
+                        const dateA = new Date(a.updated_at || a.created_at || 0).getTime();
+                        const dateB = new Date(b.updated_at || b.created_at || 0).getTime();
+                        return dateB - dateA;
+                    });
+                    const limitedSummaries = sortedSummaries.slice(0, MAX_CONVERSATIONS);
+                    
+                    console.log(`Dashboard: Loading ${limitedSummaries.length} conversations (out of ${summaries.length} total)`);
+                    
+                    const backendSessions: ChatSession[] = [];
+                    
+                    // Load conversations with a small delay between requests to avoid rate limiting
+                    for (let i = 0; i < limitedSummaries.length; i++) {
+                        if (isCancelled) break;
+                        
+                        const summary = limitedSummaries[i];
+                        if (!summary.conversation_id) continue;
+                        
+                        try {
+                            // Add small delay between requests (except first one)
+                            if (i > 0) {
+                                await new Promise(resolve => setTimeout(resolve, 50));
+                            }
+                            
+                            const conv = await apiService.getConversation(currentUser.id, summary.conversation_id);
+                            
+                            if (isCancelled) break;
+                            
+                            const messages: Message[] = (conv.messages || []).map((m, idx) => ({
+                                id: `${conv.conversation_id}_${idx}`,
+                                role: m.role,
+                                content: m.content,
+                                timestamp: new Date(m.timestamp),
+                            }));
+
+                            const firstUser = messages.find(m => m.role === 'user');
+                            const titleBase = firstUser?.content || 'Conversation';
+                            const title =
+                                titleBase.length > 24 ? `${titleBase.slice(0, 24)}...` : titleBase;
+
+                            backendSessions.push({
+                                id: conv.conversation_id,
+                                title,
+                                date: new Date(conv.updated_at || conv.created_at || Date.now()),
+                                messages,
+                            });
+                        } catch (err) {
+                            // Don't log rate limit errors as errors, just skip
+                            if (err instanceof Error && err.message.includes('429')) {
+                                console.warn(`Dashboard: Rate limited, skipping conversation ${summary.conversation_id}`);
+                            } else {
+                                console.error('Failed to load conversation from backend', err);
+                            }
+                        }
+                    }
+
+                    if (!isCancelled) {
+                        // Sort newest first
+                        backendSessions.sort((a, b) => b.date.getTime() - a.date.getTime());
+                        setSessions(backendSessions);
+                    }
+                    return;
+                }
+            } catch (err) {
+                if (!isCancelled) {
+                    console.error('Failed to load sessions from backend storage', err);
+                }
             }
-        } else {
-            setSessions([]);
-        }
-    }, [currentUser.id]); // Re-run ONLY when user ID changes
+
+            if (isCancelled) return;
+
+            // Fallback to local storage if backend fails or has no data
+            const saved = localStorage.getItem(STORAGE_KEY);
+            if (saved) {
+                try {
+                    const parsed = JSON.parse(saved);
+                    const restoredSessions: ChatSession[] = parsed.map((s: any) => ({
+                        ...s,
+                        date: new Date(s.date),
+                        messages: s.messages.map((m: any) => ({ ...m, timestamp: new Date(m.timestamp) }))
+                    }));
+                    if (restoredSessions.length > 0 && !isCancelled) {
+                        setSessions(restoredSessions);
+                    }
+                } catch (e) {
+                    console.error("Failed to parse sessions from localStorage", e);
+                }
+            }
+            
+            isLoadingConversationsRef.current = false;
+        })();
+
+        // Cleanup function to cancel any pending operations
+        return () => {
+            isCancelled = true;
+            isLoadingConversationsRef.current = false;
+        };
+    }, [currentUser.id]); // Re-run ONLY when user ID changes (STORAGE_KEY is derived from currentUser.id)
 
     // --- SAVE CHATS (Scoped to User) ---
     useEffect(() => {
@@ -333,7 +438,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, onLogout, the
             {/* Sidebar Drawer */}
             <div className="drawer-side z-[60]">
                 <label htmlFor="dashboard-drawer" aria-label="close sidebar" className="drawer-overlay"></label>
-                <div className="w-80 min-h-full bg-base-100 border-r border-base-300 text-base-content p-0">
+                <div className="w-80 h-full bg-base-100 border-r border-base-300 text-base-content p-0">
                     <Sidebar 
                         isOpen={true} 
                         onClose={() => setIsSidebarOpen(false)} 
@@ -346,9 +451,17 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, onLogout, the
                         onRenameSession={handleRenameSession}
                         theme={theme}
                         toggleTheme={toggleTheme}
+                        onOpenSettings={() => setIsSettingsOpen(true)}
                     />
                 </div>
             </div>
+            
+            <SettingsModal
+                userId={currentUser.id}
+                userName={currentUser.name}
+                isOpen={isSettingsOpen}
+                onClose={() => setIsSettingsOpen(false)}
+            />
         </div>
     );
 };

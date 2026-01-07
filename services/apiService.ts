@@ -24,6 +24,44 @@ export interface TextResponse {
   audio_base64?: string;
 }
 
+export interface Personalization {
+  user_id: string;
+  preferences: {
+    tone?: string;
+    depth?: string;
+    communication_style?: {
+      formality?: string;
+      message_length?: string;
+      punctuation_style?: string;
+      language_style?: string;
+      examples?: string[];
+    };
+  };
+  topics_of_interest?: string[];
+  goals?: string[];
+  notes?: string[];
+  [key: string]: any;
+}
+
+export interface ConversationSummary {
+  conversation_id: string;
+  created_at?: string;
+  updated_at?: string;
+  message_count?: number;
+}
+
+export interface ConversationDetail {
+  conversation_id: string;
+  user_id: string;
+  created_at?: string;
+  updated_at?: string;
+  messages: {
+    role: 'user' | 'assistant' | 'system';
+    content: string;
+    timestamp: string;
+  }[];
+}
+
 class ApiService {
   private baseUrl: string;
   private pendingChunkRequests: Map<string, AbortController> = new Map(); // Track pending chunk requests
@@ -231,6 +269,52 @@ class ApiService {
       }
       return false;
     }
+  }
+
+  async getPersonalization(userId: string): Promise<Personalization> {
+    const url = `${this.baseUrl}/api/user/personalization?user_id=${encodeURIComponent(userId)}`;
+    const response = await fetch(url, { cache: 'no-cache' });
+    if (!response.ok) {
+      throw new Error('Failed to load personalization');
+    }
+    return response.json();
+  }
+
+  async updatePersonalization(userId: string, personalization: Partial<Personalization>): Promise<Personalization> {
+    const response = await fetch(`${this.baseUrl}/api/user/personalization`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        user_id: userId,
+        personalization,
+      }),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || 'Failed to save personalization');
+    }
+    return response.json();
+  }
+
+  async listConversations(userId: string): Promise<ConversationSummary[]> {
+    const url = `${this.baseUrl}/api/conversations?user_id=${encodeURIComponent(userId)}`;
+    const response = await fetch(url, { cache: 'no-cache' });
+    if (!response.ok) {
+      throw new Error('Failed to list conversations');
+    }
+    const data = await response.json();
+    return data.conversations || [];
+  }
+
+  async getConversation(userId: string, conversationId: string): Promise<ConversationDetail> {
+    const url = `${this.baseUrl}/api/conversations/${encodeURIComponent(conversationId)}?user_id=${encodeURIComponent(userId)}`;
+    const response = await fetch(url, { cache: 'no-cache' });
+    if (!response.ok) {
+      throw new Error('Failed to load conversation');
+    }
+    return response.json();
   }
 
   /**
