@@ -2,9 +2,6 @@
 
 A voice-first AI companion that listens with care, notices emotional patterns over time, and offers calm, thoughtful support.
 
-> Built as part of **GDG TechSprint Hackathon** that listens with care, notices emotional patterns over time, and offers calm, thoughtful support.
-
-
 ---
 
 ## Problem Statement
