@@ -29,15 +29,15 @@ Build an AI companion that:
 
 ## Solution Overview
 
-### 🎬 Product Demo
+### Product Demo
 
 [![Talk With Zeno Demo](https://github.com/auraflaa/Talk-With-Zeno/blob/main/Talk%20With%20Zeno.png)](https://drive.google.com/file/d/11wGJnxeEvT0HgcFUpAoBE9nmeOCX0Zux/view?usp=sharing)
 
-> ▶️ *Click to watch a short demo of the voice-first interaction, streaming pipeline, and personalization flow.*
+> *Click to watch a short demo of the voice-first interaction, streaming pipeline, and personalization flow.*
 
 Talk With Zeno is a voice-first, emotionally intelligent AI companion that enables low-friction emotional expression through natural conversation.
 
-Instead of forms or clinical assessments, users simply speak or type. The system tracks patterns over time using explicit backend memory and responds with gentle reflections and prompts, while maintaining clear ethical boundaries.
+Instead of forms or clinical assessments, users simply speak or type. The system tracks patterns over time using explicit backend memory and responds with gentle reflections and prompts, while maintaining strict boundaries on clinical language.
 
 The intelligence comes not from hidden model memory, but from **explicit context injection and pattern tracking** managed by the backend.
 
@@ -170,7 +170,7 @@ Talk With Zeno is **not a therapist** and does not replace professional care.
 
 ## Current Status
 
-### ✅ Working
+### Working
 
 * Streaming STT → LLM → TTS pipeline
 * Voice and text modes
@@ -178,7 +178,7 @@ Talk With Zeno is **not a therapist** and does not replace professional care.
 * Personalization and memory
 * Backend and frontend logging
 
-### ⚠️ Limitations
+### Limitations
 
 * TTS rate limits (free tier)
 * File-based storage (prototype scope)
