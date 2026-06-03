@@ -1,4 +1,13 @@
+<div align="center">
+
 # Talk With Zeno
+
+
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+
+</div>
+
+---
 
 A voice-first AI companion that listens with care, notices emotional patterns over time, and offers calm, thoughtful support.
 
